@@ -46,14 +46,13 @@ public:
     // Open or create a WAL writer in `dir`. If `dir` already contains
     // segment files, continues numbering from the highest existing one.
     // Throws std::runtime_error if the directory cannot be opened.
-    static std::unique_ptr<WalWriter> Open(
-        const std::filesystem::path& dir,
-        std::size_t segment_size_bytes = kDefaultSegmentSize);
+    static std::unique_ptr<WalWriter> Open(const std::filesystem::path& dir,
+                                           std::size_t segment_size_bytes = kDefaultSegmentSize);
 
     ~WalWriter();
 
     // Owns a file descriptor — non-copyable, non-movable.
-    WalWriter(const WalWriter&)            = delete;
+    WalWriter(const WalWriter&) = delete;
     WalWriter& operator=(const WalWriter&) = delete;
 
     // Append `payload` as a new record. Returns the assigned sequence
@@ -77,11 +76,11 @@ private:
     void OpenSegment(std::uint64_t segment_num);
 
     std::filesystem::path dir_;
-    std::size_t           segment_size_;
-    std::uint64_t         next_seq_              = 1;
-    std::uint64_t         current_segment_num_   = 0;
-    std::size_t           current_segment_bytes_ = 0;
-    int                   fd_                    = -1;
+    std::size_t segment_size_;
+    std::uint64_t next_seq_ = 1;
+    std::uint64_t current_segment_num_ = 0;
+    std::size_t current_segment_bytes_ = 0;
+    int fd_ = -1;
 };
 
 // ---------------------------------------------------------------------
@@ -95,14 +94,14 @@ class WalReader {
 public:
     struct Record {
         std::uint64_t sequence;
-        std::string   payload;
+        std::string payload;
     };
 
     static std::unique_ptr<WalReader> Open(const std::filesystem::path& dir);
 
     ~WalReader();
 
-    WalReader(const WalReader&)            = delete;
+    WalReader(const WalReader&) = delete;
     WalReader& operator=(const WalReader&) = delete;
 
     // Read the next record. Returns std::nullopt at the end of the
@@ -116,9 +115,9 @@ private:
     void CloseCurrentSegment();
 
     std::vector<std::filesystem::path> segments_;
-    std::size_t                        current_segment_idx_ = 0;
-    std::uint64_t                      next_seq_            = 1;
-    int                                fd_                  = -1;
+    std::size_t current_segment_idx_ = 0;
+    std::uint64_t next_seq_ = 1;
+    int fd_ = -1;
 };
 
 }  // namespace knot::storage
