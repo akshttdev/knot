@@ -36,15 +36,23 @@ endif()
 # ----------------------------------------------------------------------
 find_package(spdlog CONFIG REQUIRED)
 find_package(fmt    CONFIG REQUIRED)
+find_package(GTest  CONFIG REQUIRED)
 
 # Will add as we use them in later weeks:
 # find_package(Boost CONFIG REQUIRED COMPONENTS system)
 # find_package(Protobuf CONFIG REQUIRED)
-# find_package(GTest CONFIG REQUIRED)
 
 # ----------------------------------------------------------------------
 # Targets
 # ----------------------------------------------------------------------
+
+# knot_storage — storage engine static library (WAL, MemTable, SSTable, ...)
+add_library(knot_storage STATIC
+    src/common/crc32.cpp
+    src/storage/wal.cpp
+)
+target_include_directories(knot_storage PUBLIC include)
+target_compile_features(knot_storage PUBLIC cxx_std_20)
 
 # knotd — the server daemon
 add_executable(knotd
@@ -52,9 +60,24 @@ add_executable(knotd
 )
 target_include_directories(knotd PRIVATE include)
 target_link_libraries(knotd PRIVATE
+    knot_storage
     spdlog::spdlog
     fmt::fmt
 )
+
+# ----------------------------------------------------------------------
+# Tests
+# ----------------------------------------------------------------------
+enable_testing()
+include(GoogleTest)
+
+add_executable(wal_test tests/unit/wal_test.cpp)
+target_link_libraries(wal_test PRIVATE
+    knot_storage
+    GTest::gtest
+    GTest::gtest_main
+)
+gtest_discover_tests(wal_test)
 
 # ----------------------------------------------------------------------
 # Install (optional, defaults are fine for now)

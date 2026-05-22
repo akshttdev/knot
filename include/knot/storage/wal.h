@@ -6,9 +6,11 @@
 //
 // Record format on disk:
 //
-//   ┌──────────┬──────────┬──────────────┐
-//   │ CRC32(4) │  Len(4)  │  Payload (N) │
-//   └──────────┴──────────┴──────────────┘
+//   ┌──────────┬──────────┬──────────┬──────────────┐
+//   │ CRC32(4) │  Seq(8)  │  Len(4)  │  Payload (N) │
+//   └──────────┴──────────┴──────────┴──────────────┘
+//
+// CRC covers [Seq | Len | Payload]. Header is 16 bytes.
 //
 // Records are stored in 64 MB segment files within a directory:
 //
@@ -54,6 +56,8 @@ public:
     // Owns a file descriptor — non-copyable, non-movable.
     WalWriter(const WalWriter&) = delete;
     WalWriter& operator=(const WalWriter&) = delete;
+    WalWriter(WalWriter&&) = delete;
+    WalWriter& operator=(WalWriter&&) = delete;
 
     // Append `payload` as a new record. Returns the assigned sequence
     // number. The bytes are in the OS page cache — NOT durable until
@@ -103,6 +107,8 @@ public:
 
     WalReader(const WalReader&) = delete;
     WalReader& operator=(const WalReader&) = delete;
+    WalReader(WalReader&&) = delete;
+    WalReader& operator=(WalReader&&) = delete;
 
     // Read the next record. Returns std::nullopt at the end of the
     // last segment. Throws std::runtime_error if a record is
@@ -116,7 +122,6 @@ private:
 
     std::vector<std::filesystem::path> segments_;
     std::size_t current_segment_idx_ = 0;
-    std::uint64_t next_seq_ = 1;
     int fd_ = -1;
 };
 

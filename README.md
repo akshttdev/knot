@@ -2,7 +2,6 @@
 
 > Distributed fault-tolerant key-value store with Raft consensus and a custom LSM-tree storage engine, written in C++20.
 
-[![CI](https://github.com/akshat/knot/actions/workflows/ci.yml/badge.svg)](https://github.com/akshat/knot/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![C++20](https://img.shields.io/badge/C%2B%2B-20-blue.svg)](https://en.cppreference.com/w/cpp/20)
 
