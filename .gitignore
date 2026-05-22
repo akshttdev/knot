@@ -1,0 +1,76 @@
+# Build artifacts
+build/
+build-*/
+out/
+cmake-build-*/
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+
+# Package managers
+vcpkg_installed/
+vcpkg/buildtrees/
+vcpkg/downloads/
+vcpkg/packages/
+node_modules/
+.pnpm-store/
+
+# Runtime data — CRITICAL, these grow fast
+data/
+*.wal
+*.sst
+*.snap
+*.manifest
+knot-*.log
+
+# Caches
+.cache/
+ccache/
+.ccache/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store
+.clangd/
+compile_commands.json
+.cache/clangd/
+
+# Generated proto code (we regenerate every build)
+*_pb2.py
+*.pb.cc
+*.pb.h
+
+# Bench raw outputs (keep summaries, not raw)
+bench/results/raw/
+bench/histories/
+
+# Profiling
+perf.data*
+*.gmon
+flamegraph-raw-*
+
+# Test outputs
+Testing/
+test-output/
+
+# Coverage
+coverage/
+*.gcov
+*.gcda
+*.gcno
+
+# Frontend
+dashboard/.next/
+dashboard/out/
+dashboard/.turbo/
+
+# Secrets
+.env
+.env.local
+*.pem
+*.key

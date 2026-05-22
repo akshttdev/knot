@@ -1,0 +1,18 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
+  "name": "knot",
+  "version-string": "0.1.0",
+  "description": "Distributed KV store with Raft + LSM",
+  "homepage": "https://github.com/akshat/knot",
+  "license": "MIT",
+  "builtin-baseline": "600e1197b22d416d9b8486da170b0558c05703ff",
+  "dependencies": [
+    "spdlog",
+    "fmt",
+    "boost-asio",
+    "boost-beast",
+    "protobuf",
+    "gtest",
+    "tomlplusplus"
+  ]
+}

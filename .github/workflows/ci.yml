@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build:
+    name: Build (Ubuntu, clang)
+    runs-on: ubuntu-latest
+
+    env:
+      VCPKG_ROOT: ${{ github.workspace }}/vcpkg
+      CC:  clang
+      CXX: clang++
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            clang ninja-build cmake pkg-config \
+            zip unzip tar curl
+
+      - name: Cache vcpkg
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ env.VCPKG_ROOT }}
+            ${{ github.workspace }}/build/default/vcpkg_installed
+          key: vcpkg-${{ runner.os }}-${{ hashFiles('vcpkg.json') }}
+          restore-keys: vcpkg-${{ runner.os }}-
+
+      - name: Bootstrap vcpkg
+        run: |
+          if [ ! -d "$VCPKG_ROOT" ]; then
+            git clone https://github.com/microsoft/vcpkg.git "$VCPKG_ROOT"
+          fi
+          "$VCPKG_ROOT/bootstrap-vcpkg.sh" -disableMetrics
+
+      - name: Configure
+        run: cmake --preset=default
+
+      - name: Build
+        run: cmake --build build/default --parallel
+
+      - name: Smoke test
+        run: ./build/default/knotd
+
+  format:
+    name: Format check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install clang-format
+        run: sudo apt-get update && sudo apt-get install -y clang-format
+
+      - name: Check formatting
+        run: |
+          mapfile -t FILES < <(find src include proto -type f \( -name '*.cpp' -o -name '*.h' -o -name '*.cc' \) 2>/dev/null)
+          if [ ${#FILES[@]} -gt 0 ]; then
+            clang-format --dry-run --Werror "${FILES[@]}"
+          else
+            echo "No source files found yet — skipping."
+          fi

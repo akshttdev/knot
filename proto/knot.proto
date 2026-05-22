@@ -1,0 +1,50 @@
+// Knot — wire-protocol schemas.
+//
+// All inter-node and client RPCs use protobuf for compact, schema-versioned
+// binary encoding. This file starts with placeholder messages; Raft RPCs
+// (RequestVote, AppendEntries, InstallSnapshot) will be added in Week 2.
+
+syntax = "proto3";
+
+package knot.rpc;
+
+// -------------------------------------------------------------------------
+// Health
+// -------------------------------------------------------------------------
+
+message HealthCheckRequest {}
+
+message HealthCheckResponse {
+  string node_id = 1;
+  string status  = 2;   // "ok" | "starting" | "shutting_down"
+  uint64 uptime_ms = 3;
+}
+
+// -------------------------------------------------------------------------
+// Common types (used by Raft + client RPCs later)
+// -------------------------------------------------------------------------
+
+message LogEntry {
+  uint64 term    = 1;
+  uint64 index   = 2;
+  EntryType type = 3;
+  bytes payload  = 4;
+}
+
+enum EntryType {
+  ENTRY_TYPE_UNSPECIFIED = 0;
+  ENTRY_TYPE_NOOP        = 1;
+  ENTRY_TYPE_COMMAND     = 2;
+  ENTRY_TYPE_CONF_CHANGE = 3;
+}
+
+// -------------------------------------------------------------------------
+// Raft RPCs — to be filled in Week 2
+// -------------------------------------------------------------------------
+
+// message RequestVoteRequest  { ... }
+// message RequestVoteResponse { ... }
+// message AppendEntriesRequest  { ... }
+// message AppendEntriesResponse { ... }
+// message InstallSnapshotRequest  { ... }
+// message InstallSnapshotResponse { ... }

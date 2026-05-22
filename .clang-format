@@ -1,0 +1,37 @@
+---
+# Knot — C++ style based on Google with minor tweaks.
+# Run: clang-format -i path/to/file.cpp
+# Check (CI): clang-format --dry-run --Werror path/to/file.cpp
+
+BasedOnStyle:       Google
+Standard:           c++20
+
+ColumnLimit:        100
+IndentWidth:        4
+TabWidth:           4
+UseTab:             Never
+AccessModifierOffset: -4
+
+PointerAlignment:        Left
+DerivePointerAlignment:  false
+
+AllowShortFunctionsOnASingleLine: Inline
+AllowShortIfStatementsOnASingleLine: false
+AllowShortLoopsOnASingleLine: false
+
+BreakBeforeBraces:  Attach
+NamespaceIndentation: None
+
+SortIncludes:       CaseSensitive
+IncludeBlocks:      Regroup
+IncludeCategories:
+  - Regex:    '^<[a-z_]+>'           # C++ standard headers
+    Priority: 1
+  - Regex:    '^<.*\.h>'             # C system headers
+    Priority: 2
+  - Regex:    '^<.+>'                # Other library headers
+    Priority: 3
+  - Regex:    '^"knot/.*"'           # Project headers
+    Priority: 4
+  - Regex:    '^".*"'                # Other quoted headers
+    Priority: 5
