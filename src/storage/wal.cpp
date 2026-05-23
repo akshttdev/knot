@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <cerrno>
+#include <charconv>
 #include <cstdio>
 #include <cstring>
 #include <stdexcept>
@@ -20,7 +21,9 @@ constexpr std::size_t kHeaderSize = 16;  // CRC(4) + Seq(8) + Len(4)
 
 std::string SegmentFileName(std::uint64_t num) {
     char buf[16];
-    std::snprintf(buf, sizeof(buf), "%06llu.wal", static_cast<unsigned long long>(num));
+    // Cast return value to void: we control the format + buffer size, so
+    // there's nothing useful to do with the byte count snprintf returns.
+    (void)std::snprintf(buf, sizeof(buf), "%06llu.wal", static_cast<unsigned long long>(num));
     return buf;
 }
 
@@ -33,11 +36,15 @@ std::uint64_t HighestSegmentNumber(const std::filesystem::path& dir) {
         if (entry.path().extension() != ".wal") {
             continue;
         }
-        try {
-            auto num = std::stoull(entry.path().stem().string());
-            highest = std::max(highest, static_cast<std::uint64_t>(num));
-        } catch (...) {
-            // not a numeric stem — ignore
+        // Non-throwing parse via std::from_chars (C++17). Skip files whose
+        // stem isn't a pure number — those aren't ours.
+        const auto stem = entry.path().stem().string();
+        std::uint64_t num = 0;
+        const auto* begin = stem.data();
+        const auto* end = stem.data() + stem.size();
+        auto [ptr, ec] = std::from_chars(begin, end, num);
+        if (ec == std::errc{} && ptr == end) {
+            highest = std::max(highest, num);
         }
     }
     return highest;

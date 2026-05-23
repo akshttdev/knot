@@ -50,6 +50,7 @@ find_package(GTest  CONFIG REQUIRED)
 add_library(knot_storage STATIC
     src/common/crc32.cpp
     src/storage/wal.cpp
+    src/storage/memtable.cpp
 )
 target_include_directories(knot_storage PUBLIC include)
 target_compile_features(knot_storage PUBLIC cxx_std_20)
@@ -78,6 +79,14 @@ target_link_libraries(wal_test PRIVATE
     GTest::gtest_main
 )
 gtest_discover_tests(wal_test)
+
+add_executable(memtable_test tests/unit/memtable_test.cpp)
+target_link_libraries(memtable_test PRIVATE
+    knot_storage
+    GTest::gtest
+    GTest::gtest_main
+)
+gtest_discover_tests(memtable_test)
 
 # ----------------------------------------------------------------------
 # Install (optional, defaults are fine for now)

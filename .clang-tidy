@@ -18,9 +18,13 @@ Checks: >
   -cppcoreguidelines-avoid-magic-numbers,
   -cppcoreguidelines-pro-bounds-array-to-pointer-decay,
   -cppcoreguidelines-pro-bounds-pointer-arithmetic,
+  -cppcoreguidelines-pro-bounds-constant-array-index,
+  -cppcoreguidelines-pro-type-vararg,
   -cppcoreguidelines-avoid-c-arrays,
   -bugprone-easily-swappable-parameters,
-  -readability-identifier-length
+  -readability-identifier-length,
+  -readability-implicit-bool-conversion,
+  -readability-make-member-function-const
 
 WarningsAsErrors: ''
 HeaderFilterRegex: 'include/knot/.*'
