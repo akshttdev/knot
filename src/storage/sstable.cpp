@@ -230,7 +230,7 @@ std::unique_ptr<SSTableReader> SSTableReader::Open(const std::filesystem::path& 
         ThrowErrno("SSTableReader::Open(" + path.string() + ")");
     }
 
-    struct stat st{};
+    struct stat st = {};
     if (::fstat(reader->fd_, &st) < 0) {
         ThrowErrno("fstat");
     }
