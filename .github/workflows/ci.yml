@@ -6,6 +6,11 @@ on:
   pull_request:
     branches: [ main ]
 
+# Opt all actions into Node.js 24 (Node 20 is deprecated, will be removed
+# Sep 2026). Safe to remove once Node 24 becomes the default.
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
   build:
     name: Build (Ubuntu, clang)
