@@ -52,6 +52,7 @@ add_library(knot_storage STATIC
     src/storage/wal.cpp
     src/storage/memtable.cpp
     src/storage/sstable.cpp
+    src/storage/engine.cpp
 )
 target_include_directories(knot_storage PUBLIC include)
 target_compile_features(knot_storage PUBLIC cxx_std_20)
@@ -96,6 +97,14 @@ target_link_libraries(sstable_test PRIVATE
     GTest::gtest_main
 )
 gtest_discover_tests(sstable_test)
+
+add_executable(engine_test tests/unit/engine_test.cpp)
+target_link_libraries(engine_test PRIVATE
+    knot_storage
+    GTest::gtest
+    GTest::gtest_main
+)
+gtest_discover_tests(engine_test)
 
 # ----------------------------------------------------------------------
 # Install (optional, defaults are fine for now)
