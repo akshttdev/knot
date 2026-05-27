@@ -57,6 +57,15 @@ add_library(knot_storage STATIC
 target_include_directories(knot_storage PUBLIC include)
 target_compile_features(knot_storage PUBLIC cxx_std_20)
 
+# knot_raft — Raft consensus static library (log, transport, node)
+add_library(knot_raft STATIC
+    src/raft/log.cpp
+    src/raft/transport.cpp
+    src/raft/node.cpp
+)
+target_include_directories(knot_raft PUBLIC include)
+target_compile_features(knot_raft PUBLIC cxx_std_20)
+
 # knotd — the server daemon
 add_executable(knotd
     src/server/main.cpp
@@ -105,6 +114,30 @@ target_link_libraries(engine_test PRIVATE
     GTest::gtest_main
 )
 gtest_discover_tests(engine_test)
+
+add_executable(raft_log_test tests/unit/raft_log_test.cpp)
+target_link_libraries(raft_log_test PRIVATE
+    knot_raft
+    GTest::gtest
+    GTest::gtest_main
+)
+gtest_discover_tests(raft_log_test)
+
+add_executable(raft_transport_test tests/unit/raft_transport_test.cpp)
+target_link_libraries(raft_transport_test PRIVATE
+    knot_raft
+    GTest::gtest
+    GTest::gtest_main
+)
+gtest_discover_tests(raft_transport_test)
+
+add_executable(raft_node_test tests/unit/raft_node_test.cpp)
+target_link_libraries(raft_node_test PRIVATE
+    knot_raft
+    GTest::gtest
+    GTest::gtest_main
+)
+gtest_discover_tests(raft_node_test)
 
 # ----------------------------------------------------------------------
 # Install (optional, defaults are fine for now)
