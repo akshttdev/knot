@@ -74,3 +74,5 @@ dashboard/.turbo/
 .env.local
 *.pem
 *.key
+docs/HANDOVER.md
+docs/superpowers/
