@@ -244,9 +244,34 @@ TEST(RaftNodeTest, AlreadyVotedRejectsOtherCandidate) {
 }
 
 TEST(RaftNodeTest, OutOfDateCandidateLogRejected) {
-    // Requires log-mutation API not yet exposed; revisit in Day 11 after
-    // real AppendEntries replication exercises this path naturally.
-    GTEST_SKIP() << "Requires log-mutation API; revisit in Day 11.";
+    auto n = RaftNode::Create({.self = "f", .peers = {"l"}, .rng_seed = 1});
+
+    // Seed our log via AE: 3 entries at term 5.
+    LogEntry e1{.term = 5, .index = 1, .type = EntryType::kCommand, .payload = "a"};
+    LogEntry e2{.term = 5, .index = 2, .type = EntryType::kCommand, .payload = "b"};
+    LogEntry e3{.term = 5, .index = 3, .type = EntryType::kCommand, .payload = "c"};
+    n->Step(Envelope{.from = "l",
+                     .to = "f",
+                     .msg = AppendEntriesReq{.term = 5,
+                                             .leader_id = "l",
+                                             .prev_log_index = 0,
+                                             .prev_log_term = 0,
+                                             .entries = {e1, e2, e3},
+                                             .leader_commit = 0}});
+    (void)n->TakeOutgoing();
+    EXPECT_EQ(n->LastLogIndex(), 3U);
+    EXPECT_EQ(n->CurrentTerm(), 5U);
+
+    // RVReq from candidate with last_log_term=3 (< our 5) → reject.
+    n->Step(
+        Envelope{.from = "c",
+                 .to = "f",
+                 .msg = RequestVoteReq{
+                     .term = 6, .candidate_id = "c", .last_log_index = 10, .last_log_term = 3}});
+    auto out = n->TakeOutgoing();
+    ASSERT_EQ(out.size(), 1U);
+    const auto& r = std::get<RequestVoteResp>(out[0].msg);
+    EXPECT_FALSE(r.vote_granted);
 }
 
 TEST(RaftNodeTest, LeaderBroadcastsHeartbeatsEveryInterval) {
@@ -466,4 +491,500 @@ TEST(RaftNodeIntegrationTest, ThreeNodeElectsLeaderAndHoldsViaHeartbeats) {
         }
     }
     EXPECT_EQ(still_leader, 1);
+}
+
+TEST(RaftNodeTest, SubmitOnFollowerReturnsNullopt) {
+    auto n = RaftNode::Create({.self = "f", .peers = {"l"}, .rng_seed = 1});
+    EXPECT_EQ(n->CurrentRole(), Role::kFollower);
+    EXPECT_EQ(n->Submit(EntryType::kCommand, "x"), std::nullopt);
+    EXPECT_EQ(n->LastLogIndex(), 0U);
+}
+
+TEST(RaftNodeTest, SubmitOnLeaderAppendsAndReturnsIndex) {
+    auto n = RaftNode::Create({.self = "a",
+                               .peers = {"b"},
+                               .election_timeout_min_ticks = 2,
+                               .election_timeout_max_ticks = 2,
+                               .rng_seed = 1});
+    for (int i = 0; i < 2; ++i) {
+        n->Tick();
+    }
+    n->Step(
+        Envelope{.from = "b", .to = "a", .msg = RequestVoteResp{.term = 1, .vote_granted = true}});
+    ASSERT_EQ(n->CurrentRole(), Role::kLeader);
+    (void)n->TakeOutgoing();
+
+    auto idx = n->Submit(EntryType::kCommand, "hello");
+    ASSERT_TRUE(idx.has_value());
+    EXPECT_EQ(*idx, 1U);
+    EXPECT_EQ(n->LastLogIndex(), 1U);
+
+    auto idx2 = n->Submit(EntryType::kCommand, "world");
+    ASSERT_TRUE(idx2.has_value());
+    EXPECT_EQ(*idx2, 2U);
+    EXPECT_EQ(n->LastLogIndex(), 2U);
+}
+
+TEST(RaftNodeTest, LeaderInitializesPerPeerReplicationStateOnElection) {
+    auto n = RaftNode::Create({.self = "a",
+                               .peers = {"b", "c"},
+                               .election_timeout_min_ticks = 2,
+                               .election_timeout_max_ticks = 2,
+                               .heartbeat_interval_ticks = 5,
+                               .rng_seed = 1});
+    for (int i = 0; i < 2; ++i) {
+        n->Tick();
+    }
+    // Drain the RequestVote broadcast emitted by BecomeCandidate.
+    (void)n->TakeOutgoing();
+    n->Step(
+        Envelope{.from = "b", .to = "a", .msg = RequestVoteResp{.term = 1, .vote_granted = true}});
+    ASSERT_EQ(n->CurrentRole(), Role::kLeader);
+
+    // First heartbeat out of BecomeLeader: with next_index[peer] = 1,
+    // BroadcastHeartbeat's prev_log_index comes from log.LastIndex() = 0
+    // (since heartbeat currently uses LastLogIndex, not per-peer next).
+    // Test the OBSERVABLE: prev_log_index/term are 0 and entries are empty.
+    auto out = n->TakeOutgoing();
+    ASSERT_EQ(out.size(), 2U);
+    for (const auto& env : out) {
+        ASSERT_TRUE(std::holds_alternative<AppendEntriesReq>(env.msg));
+        const auto& ae = std::get<AppendEntriesReq>(env.msg);
+        EXPECT_EQ(ae.prev_log_index, 0U);
+        EXPECT_EQ(ae.prev_log_term, 0U);
+        EXPECT_TRUE(ae.entries.empty());
+    }
+}
+
+TEST(RaftNodeTest, SubmitTriggersImmediateBroadcastWithEntry) {
+    auto n = RaftNode::Create({.self = "a",
+                               .peers = {"b", "c"},
+                               .election_timeout_min_ticks = 2,
+                               .election_timeout_max_ticks = 2,
+                               .rng_seed = 1});
+    for (int i = 0; i < 2; ++i) {
+        n->Tick();
+    }
+    n->Step(
+        Envelope{.from = "b", .to = "a", .msg = RequestVoteResp{.term = 1, .vote_granted = true}});
+    (void)n->TakeOutgoing();  // drain BecomeLeader's initial broadcast
+
+    auto idx = n->Submit(EntryType::kCommand, "v1");
+    ASSERT_TRUE(idx.has_value());
+    auto out = n->TakeOutgoing();
+    ASSERT_EQ(out.size(), 2U);
+    for (const auto& env : out) {
+        ASSERT_TRUE(std::holds_alternative<AppendEntriesReq>(env.msg));
+        const auto& ae = std::get<AppendEntriesReq>(env.msg);
+        EXPECT_EQ(ae.prev_log_index, 0U);
+        EXPECT_EQ(ae.prev_log_term, 0U);
+        ASSERT_EQ(ae.entries.size(), 1U);
+        EXPECT_EQ(ae.entries[0].index, 1U);
+        EXPECT_EQ(ae.entries[0].term, 1U);
+        EXPECT_EQ(ae.entries[0].payload, "v1");
+    }
+}
+
+TEST(RaftNodeTest, FollowerAcceptsAEWithMatchingPrevLogAndAppends) {
+    auto n = RaftNode::Create({.self = "f", .peers = {"l"}, .rng_seed = 1});
+
+    // Anchor at prev=0 to set term/leader; log stays empty.
+    n->Step(Envelope{.from = "l",
+                     .to = "f",
+                     .msg = AppendEntriesReq{.term = 1,
+                                             .leader_id = "l",
+                                             .prev_log_index = 0,
+                                             .prev_log_term = 0,
+                                             .entries = {},
+                                             .leader_commit = 0}});
+    (void)n->TakeOutgoing();
+    EXPECT_EQ(n->LastLogIndex(), 0U);
+
+    // Deliver 2 entries with matching prev (=0, term 0).
+    LogEntry e1{.term = 1, .index = 1, .type = EntryType::kCommand, .payload = "a"};
+    LogEntry e2{.term = 1, .index = 2, .type = EntryType::kCommand, .payload = "b"};
+    n->Step(Envelope{.from = "l",
+                     .to = "f",
+                     .msg = AppendEntriesReq{.term = 1,
+                                             .leader_id = "l",
+                                             .prev_log_index = 0,
+                                             .prev_log_term = 0,
+                                             .entries = {e1, e2},
+                                             .leader_commit = 0}});
+    auto out = n->TakeOutgoing();
+    ASSERT_EQ(out.size(), 1U);
+    const auto& r = std::get<AppendEntriesResp>(out[0].msg);
+    EXPECT_TRUE(r.success);
+    EXPECT_EQ(r.match_index, 2U);
+    EXPECT_EQ(n->LastLogIndex(), 2U);
+}
+
+TEST(RaftNodeTest, FollowerRejectsAEWhenLogTooShort) {
+    auto n = RaftNode::Create({.self = "f", .peers = {"l"}, .rng_seed = 1});
+
+    // Empty log, AE claims prev_log_index=5.
+    n->Step(Envelope{.from = "l",
+                     .to = "f",
+                     .msg = AppendEntriesReq{.term = 1,
+                                             .leader_id = "l",
+                                             .prev_log_index = 5,
+                                             .prev_log_term = 1,
+                                             .entries = {},
+                                             .leader_commit = 0}});
+    auto out = n->TakeOutgoing();
+    ASSERT_EQ(out.size(), 1U);
+    const auto& r = std::get<AppendEntriesResp>(out[0].msg);
+    EXPECT_FALSE(r.success);
+    EXPECT_EQ(n->LastLogIndex(), 0U);  // log unchanged
+}
+
+TEST(RaftNodeTest, FollowerRejectionSendsConflictIndexWhenLogTooShort) {
+    auto n = RaftNode::Create({.self = "f", .peers = {"l"}, .rng_seed = 1});
+    n->Step(Envelope{.from = "l",
+                     .to = "f",
+                     .msg = AppendEntriesReq{.term = 1,
+                                             .leader_id = "l",
+                                             .prev_log_index = 5,
+                                             .prev_log_term = 1,
+                                             .entries = {},
+                                             .leader_commit = 0}});
+    auto out = n->TakeOutgoing();
+    ASSERT_EQ(out.size(), 1U);
+    const auto& r = std::get<AppendEntriesResp>(out[0].msg);
+    EXPECT_FALSE(r.success);
+    EXPECT_EQ(r.conflict_index, 1U);  // empty log: LastIndex()+1 = 0+1
+    EXPECT_EQ(r.conflict_term, 0U);
+}
+
+TEST(RaftNodeTest, FollowerRejectionSendsConflictTermOnTermMismatch) {
+    auto n = RaftNode::Create({.self = "f", .peers = {"l"}, .rng_seed = 1});
+    // Seed: 3 entries at term 1.
+    LogEntry e1{.term = 1, .index = 1, .type = EntryType::kCommand, .payload = "a"};
+    LogEntry e2{.term = 1, .index = 2, .type = EntryType::kCommand, .payload = "b"};
+    LogEntry e3{.term = 1, .index = 3, .type = EntryType::kCommand, .payload = "c"};
+    n->Step(Envelope{.from = "l",
+                     .to = "f",
+                     .msg = AppendEntriesReq{.term = 1,
+                                             .leader_id = "l",
+                                             .prev_log_index = 0,
+                                             .prev_log_term = 0,
+                                             .entries = {e1, e2, e3},
+                                             .leader_commit = 0}});
+    (void)n->TakeOutgoing();
+
+    // Now leader claims prev_log_index=3 with term=2 — mismatch (our log has term=1).
+    n->Step(Envelope{.from = "l",
+                     .to = "f",
+                     .msg = AppendEntriesReq{.term = 2,
+                                             .leader_id = "l",
+                                             .prev_log_index = 3,
+                                             .prev_log_term = 2,
+                                             .entries = {},
+                                             .leader_commit = 0}});
+    auto out = n->TakeOutgoing();
+    ASSERT_EQ(out.size(), 1U);
+    const auto& r = std::get<AppendEntriesResp>(out[0].msg);
+    EXPECT_FALSE(r.success);
+    EXPECT_EQ(r.conflict_term, 1U);   // our log's term at idx 3
+    EXPECT_EQ(r.conflict_index, 1U);  // first idx in our log with that term
+}
+
+TEST(RaftNodeTest, FollowerTruncatesConflictingSuffixAndAppends) {
+    auto n = RaftNode::Create({.self = "f", .peers = {"l"}, .rng_seed = 1});
+
+    // Seed: 3 entries at term 1.
+    LogEntry e1{.term = 1, .index = 1, .type = EntryType::kCommand, .payload = "a"};
+    LogEntry e2{.term = 1, .index = 2, .type = EntryType::kCommand, .payload = "b"};
+    LogEntry e3{.term = 1, .index = 3, .type = EntryType::kCommand, .payload = "c"};
+    n->Step(Envelope{.from = "l",
+                     .to = "f",
+                     .msg = AppendEntriesReq{.term = 1,
+                                             .leader_id = "l",
+                                             .prev_log_index = 0,
+                                             .prev_log_term = 0,
+                                             .entries = {e1, e2, e3},
+                                             .leader_commit = 0}});
+    (void)n->TakeOutgoing();
+    ASSERT_EQ(n->LastLogIndex(), 3U);
+
+    // New leader at term 2 sends a DIFFERENT entry at index 2 (overwrites idx 2,3).
+    LogEntry new2{.term = 2, .index = 2, .type = EntryType::kCommand, .payload = "B'"};
+    n->Step(Envelope{.from = "l",
+                     .to = "f",
+                     .msg = AppendEntriesReq{.term = 2,
+                                             .leader_id = "l",
+                                             .prev_log_index = 1,
+                                             .prev_log_term = 1,
+                                             .entries = {new2},
+                                             .leader_commit = 0}});
+    (void)n->TakeOutgoing();
+    EXPECT_EQ(n->LastLogIndex(), 2U);
+}
+
+TEST(RaftNodeTest, LeaderAdvancesMatchAndNextOnSuccessfulAEResp) {
+    auto n = RaftNode::Create({.self = "a",
+                               .peers = {"b"},
+                               .election_timeout_min_ticks = 2,
+                               .election_timeout_max_ticks = 2,
+                               .rng_seed = 1});
+    for (int i = 0; i < 2; ++i) {
+        n->Tick();
+    }
+    n->Step(
+        Envelope{.from = "b", .to = "a", .msg = RequestVoteResp{.term = 1, .vote_granted = true}});
+    ASSERT_EQ(n->CurrentRole(), Role::kLeader);
+
+    // Submit 2 entries to fill log.
+    (void)n->Submit(EntryType::kCommand, "x");
+    (void)n->Submit(EntryType::kCommand, "y");
+    (void)n->TakeOutgoing();
+
+    // Follower acks success at match_index=2.
+    n->Step(Envelope{.from = "b",
+                     .to = "a",
+                     .msg = AppendEntriesResp{.term = 1, .success = true, .match_index = 2}});
+
+    // Next Submit triggers an AE with prev_log_index=2 (next_index advanced to 3).
+    (void)n->Submit(EntryType::kCommand, "z");
+    auto out = n->TakeOutgoing();
+    bool saw_advanced = false;
+    for (const auto& env : out) {
+        if (env.to == "b") {
+            const auto& ae = std::get<AppendEntriesReq>(env.msg);
+            if (ae.prev_log_index == 2U) {
+                saw_advanced = true;
+            }
+        }
+    }
+    EXPECT_TRUE(saw_advanced);
+}
+
+TEST(RaftNodeTest, LeaderBacksOffNextIndexUsingConflictIndex) {
+    auto n = RaftNode::Create({.self = "a",
+                               .peers = {"b"},
+                               .election_timeout_min_ticks = 2,
+                               .election_timeout_max_ticks = 2,
+                               .rng_seed = 1});
+    for (int i = 0; i < 2; ++i) {
+        n->Tick();
+    }
+    n->Step(
+        Envelope{.from = "b", .to = "a", .msg = RequestVoteResp{.term = 1, .vote_granted = true}});
+    // Build leader log to LastIndex=5.
+    for (int i = 0; i < 5; ++i) {
+        (void)n->Submit(EntryType::kCommand, "x");
+    }
+    (void)n->TakeOutgoing();
+
+    // Follower rejects with conflict_index=3, conflict_term=0 (log too short).
+    n->Step(Envelope{.from = "b",
+                     .to = "a",
+                     .msg = AppendEntriesResp{.term = 1,
+                                              .success = false,
+                                              .match_index = 0,
+                                              .conflict_index = 3,
+                                              .conflict_term = 0}});
+
+    // Next AE to "b" should have prev_log_index=2 (since next_index dropped to 3).
+    (void)n->Submit(EntryType::kCommand, "y");
+    auto out = n->TakeOutgoing();
+    bool saw = false;
+    for (const auto& env : out) {
+        if (env.to == "b") {
+            const auto& ae = std::get<AppendEntriesReq>(env.msg);
+            if (ae.prev_log_index == 2U) {
+                saw = true;
+            }
+        }
+    }
+    EXPECT_TRUE(saw);
+}
+
+TEST(RaftNodeTest, LeaderBacksOffByOneIfNoConflictHints) {
+    auto n = RaftNode::Create({.self = "a",
+                               .peers = {"b"},
+                               .election_timeout_min_ticks = 2,
+                               .election_timeout_max_ticks = 2,
+                               .rng_seed = 1});
+    for (int i = 0; i < 2; ++i) {
+        n->Tick();
+    }
+    n->Step(
+        Envelope{.from = "b", .to = "a", .msg = RequestVoteResp{.term = 1, .vote_granted = true}});
+    for (int i = 0; i < 3; ++i) {
+        (void)n->Submit(EntryType::kCommand, "x");
+    }
+    (void)n->TakeOutgoing();
+    // Initial next_index[b] = 4 (LastLogIndex 3 + 1). Reject without hints.
+    n->Step(Envelope{.from = "b",
+                     .to = "a",
+                     .msg = AppendEntriesResp{.term = 1,
+                                              .success = false,
+                                              .match_index = 0,
+                                              .conflict_index = 0,
+                                              .conflict_term = 0}});
+    (void)n->Submit(EntryType::kCommand, "y");
+    auto out = n->TakeOutgoing();
+    bool saw_back_off = false;
+    for (const auto& env : out) {
+        if (env.to == "b") {
+            const auto& ae = std::get<AppendEntriesReq>(env.msg);
+            // next_index should have decreased by 1 from 4 to 3 ⇒ prev=2.
+            if (ae.prev_log_index == 2U) {
+                saw_back_off = true;
+            }
+        }
+    }
+    EXPECT_TRUE(saw_back_off);
+}
+
+TEST(RaftNodeTest, LeaderAdvancesCommitIndexOnMajorityMatch) {
+    auto n = RaftNode::Create({.self = "a",
+                               .peers = {"b", "c"},
+                               .election_timeout_min_ticks = 2,
+                               .election_timeout_max_ticks = 2,
+                               .rng_seed = 1});
+    for (int i = 0; i < 2; ++i) {
+        n->Tick();
+    }
+    n->Step(
+        Envelope{.from = "b", .to = "a", .msg = RequestVoteResp{.term = 1, .vote_granted = true}});
+    ASSERT_EQ(n->CurrentRole(), Role::kLeader);
+
+    (void)n->Submit(EntryType::kCommand, "x");
+    (void)n->TakeOutgoing();
+    EXPECT_EQ(n->CommitIndex(), 0U);
+
+    // Quorum in 3-node cluster = 2. Leader counts as 1; one follower ack -> commit.
+    n->Step(Envelope{.from = "b",
+                     .to = "a",
+                     .msg = AppendEntriesResp{.term = 1, .success = true, .match_index = 1}});
+    EXPECT_EQ(n->CommitIndex(), 1U);
+}
+
+TEST(RaftNodeTest, LeaderDoesNotCommitOnHigherTermResponse) {
+    // §5.4.2 boundary: a higher-term AEResp causes step-down BEFORE the
+    // commit-advance can fire. So commit_index stays at 0.
+    auto n = RaftNode::Create({.self = "a",
+                               .peers = {"b", "c"},
+                               .election_timeout_min_ticks = 2,
+                               .election_timeout_max_ticks = 2,
+                               .rng_seed = 1});
+    for (int i = 0; i < 2; ++i) {
+        n->Tick();
+    }
+    n->Step(
+        Envelope{.from = "b", .to = "a", .msg = RequestVoteResp{.term = 1, .vote_granted = true}});
+    (void)n->Submit(EntryType::kCommand, "x");
+    (void)n->TakeOutgoing();
+
+    n->Step(Envelope{.from = "b",
+                     .to = "a",
+                     .msg = AppendEntriesResp{.term = 5, .success = false, .match_index = 0}});
+    EXPECT_EQ(n->CurrentRole(), Role::kFollower);
+    EXPECT_EQ(n->CommitIndex(), 0U);
+}
+
+TEST(RaftNodeTest, FollowerAdvancesCommitIndexFromLeaderCommit) {
+    auto n = RaftNode::Create({.self = "f", .peers = {"l"}, .rng_seed = 1});
+
+    LogEntry e1{.term = 1, .index = 1, .type = EntryType::kCommand, .payload = "a"};
+    LogEntry e2{.term = 1, .index = 2, .type = EntryType::kCommand, .payload = "b"};
+    n->Step(Envelope{.from = "l",
+                     .to = "f",
+                     .msg = AppendEntriesReq{.term = 1,
+                                             .leader_id = "l",
+                                             .prev_log_index = 0,
+                                             .prev_log_term = 0,
+                                             .entries = {e1, e2},
+                                             .leader_commit = 2}});
+    EXPECT_EQ(n->CommitIndex(), 2U);
+}
+
+TEST(RaftNodeTest, TakeCommittedReturnsRangeOnceThenEmpty) {
+    auto n = RaftNode::Create({.self = "f", .peers = {"l"}, .rng_seed = 1});
+
+    LogEntry e1{.term = 1, .index = 1, .type = EntryType::kCommand, .payload = "a"};
+    LogEntry e2{.term = 1, .index = 2, .type = EntryType::kCommand, .payload = "b"};
+    LogEntry e3{.term = 1, .index = 3, .type = EntryType::kCommand, .payload = "c"};
+    n->Step(Envelope{.from = "l",
+                     .to = "f",
+                     .msg = AppendEntriesReq{.term = 1,
+                                             .leader_id = "l",
+                                             .prev_log_index = 0,
+                                             .prev_log_term = 0,
+                                             .entries = {e1, e2, e3},
+                                             .leader_commit = 3}});
+    (void)n->TakeOutgoing();
+
+    auto out = n->TakeCommitted();
+    ASSERT_EQ(out.size(), 3U);
+    EXPECT_EQ(out[0].payload, "a");
+    EXPECT_EQ(out[1].payload, "b");
+    EXPECT_EQ(out[2].payload, "c");
+
+    EXPECT_TRUE(n->TakeCommitted().empty());  // already drained
+}
+
+TEST(RaftNodeIntegrationTest, ThreeNodeReplicatesSubmittedEntryToAll) {
+    InMemoryBus bus;
+
+    const std::vector<NodeId> all = {"n1", "n2", "n3"};
+    std::vector<std::unique_ptr<RaftNode>> nodes;
+    std::vector<std::unique_ptr<Transport>> transports;
+
+    std::uint64_t seed = 100;
+    for (const auto& id : all) {
+        std::vector<NodeId> peers;
+        for (const auto& other : all) {
+            if (other != id) {
+                peers.push_back(other);
+            }
+        }
+        nodes.push_back(RaftNode::Create({.self = id,
+                                          .peers = peers,
+                                          .election_timeout_min_ticks = 5,
+                                          .election_timeout_max_ticks = 15,
+                                          .heartbeat_interval_ticks = 2,
+                                          .rng_seed = seed++}));
+        transports.push_back(bus.Connect(id));
+    }
+
+    // Drive 60 ticks → leader emerges.
+    for (int t = 0; t < 60; ++t) {
+        for (std::size_t i = 0; i < nodes.size(); ++i) {
+            StepWorld(*nodes[i], *transports[i]);
+        }
+    }
+
+    RaftNode* leader = nullptr;
+    for (const auto& n : nodes) {
+        if (n->CurrentRole() == Role::kLeader) {
+            leader = n.get();
+            break;
+        }
+    }
+    ASSERT_NE(leader, nullptr);
+
+    auto idx = leader->Submit(EntryType::kCommand, "hello");
+    ASSERT_TRUE(idx.has_value());
+    EXPECT_EQ(*idx, 1U);
+
+    // Drive enough ticks for: leader broadcasts entry → follower acks →
+    // leader advances commit_index → next heartbeat carries leader_commit →
+    // follower advances its own commit_index.
+    for (int t = 0; t < 30; ++t) {
+        for (std::size_t i = 0; i < nodes.size(); ++i) {
+            StepWorld(*nodes[i], *transports[i]);
+        }
+    }
+
+    // Every node should see the entry via TakeCommitted.
+    for (std::size_t i = 0; i < nodes.size(); ++i) {
+        auto applied = nodes[i]->TakeCommitted();
+        ASSERT_EQ(applied.size(), 1U)
+            << "node " << all[i] << " expected 1 committed entry, got " << applied.size();
+        EXPECT_EQ(applied[0].payload, "hello");
+        EXPECT_EQ(applied[0].index, 1U);
+    }
 }

@@ -33,7 +33,9 @@ struct AppendEntriesReq {
 struct AppendEntriesResp {
     Term term;
     bool success;
-    LogIdx match_index;  // Day 12 will add conflict_index/conflict_term
+    LogIdx match_index = 0;
+    LogIdx conflict_index = 0;  // Day 12: §5.3 fast-back-off hint
+    Term conflict_term = 0;     // Day 12: term at conflict_index
 };
 
 using Message = std::variant<RequestVoteReq, RequestVoteResp, AppendEntriesReq, AppendEntriesResp>;

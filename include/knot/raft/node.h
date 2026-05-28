@@ -48,6 +48,7 @@ public:
     void Step(const Envelope& env);
     [[nodiscard]] std::vector<Envelope> TakeOutgoing();
     [[nodiscard]] std::vector<LogEntry> TakeCommitted();  // Day 8: always empty
+    [[nodiscard]] std::optional<LogIdx> Submit(EntryType type, std::string payload);
 
     [[nodiscard]] const NodeId& Self() const;
     [[nodiscard]] Role CurrentRole() const;
