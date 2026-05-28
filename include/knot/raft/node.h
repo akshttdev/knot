@@ -14,7 +14,9 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <memory>
+#include <optional>
 #include <vector>
 
 #include <knot/raft/messages.h>
@@ -27,6 +29,10 @@ public:
     struct Config {
         NodeId self;
         std::vector<NodeId> peers;  // must NOT include self
+        std::size_t election_timeout_min_ticks = 15;
+        std::size_t election_timeout_max_ticks = 30;
+        std::size_t heartbeat_interval_ticks = 5;
+        std::optional<std::uint64_t> rng_seed;
     };
 
     [[nodiscard]] static std::unique_ptr<RaftNode> Create(Config cfg);
