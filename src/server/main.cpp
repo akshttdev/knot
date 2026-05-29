@@ -5,11 +5,12 @@
 //
 // Usage:
 //   knotd --id=<id> --listen=<host:port> [--peer=<id@host:port>]... \
-//         --data-dir=<path>
+//         --data-dir=<path> [--client-listen=<host:port>]
 //
 // Example (3-node cluster, run each in a separate terminal):
 //   knotd --id=n1 --listen=127.0.0.1:7001 \
 //         --peer=n2@127.0.0.1:7002 --peer=n3@127.0.0.1:7003 \
+//         --client-listen=127.0.0.1:8001 \
 //         --data-dir=./data/n1
 
 #include <atomic>
@@ -17,16 +18,22 @@
 #include <csignal>
 #include <cstdint>
 #include <cstdlib>
+#include <filesystem>
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <type_traits>
 #include <vector>
 
+#include <knot/raft/command.h>
 #include <knot/raft/node.h>
 #include <knot/raft/persister.h>
 #include <knot/raft/tcp_transport.h>
+#include <knot/server/client_server.h>
+#include <knot/storage/engine.h>
 #include <spdlog/spdlog.h>
 
 namespace {
@@ -45,15 +52,21 @@ struct CliArgs {
     std::uint16_t listen_port = 0;
     std::vector<knot::raft::PeerEndpoint> peers;
     std::string data_dir;
+
+    // Day 16 additions:
+    std::string client_listen_host;
+    std::uint16_t client_listen_port = 0;
 };
 
 void PrintUsage() {
     std::cerr << "Usage: knotd --id=<id> --listen=<host:port> "
-                 "[--peer=<id@host:port>]... --data-dir=<path>\n"
+                 "[--peer=<id@host:port>]... --data-dir=<path> "
+                 "[--client-listen=<host:port>]\n"
                  "\n"
                  "Example (3-node cluster, run each in a separate terminal):\n"
                  "  knotd --id=n1 --listen=127.0.0.1:7001 \\\n"
                  "        --peer=n2@127.0.0.1:7002 --peer=n3@127.0.0.1:7003 \\\n"
+                 "        --client-listen=127.0.0.1:8001 \\\n"
                  "        --data-dir=./data/n1\n";
 }
 
@@ -104,12 +117,42 @@ bool ParseArgs(int argc, char** argv, CliArgs* out) {
             out->peers.push_back(pe);
         } else if (a.starts_with("--data-dir=")) {
             out->data_dir = a.substr(11);
+        } else if (a.starts_with("--client-listen=")) {
+            if (!ParseHostPort(a.substr(16), &out->client_listen_host, &out->client_listen_port)) {
+                std::cerr << "knotd: bad --client-listen: " << a << "\n";
+                return false;
+            }
         } else {
             std::cerr << "knotd: unknown arg: " << a << "\n";
             return false;
         }
     }
     return !out->id.empty() && !out->listen_host.empty();
+}
+
+void ApplyCommittedEntries(knot::raft::RaftNode* node, knot::storage::StorageEngine* engine,
+                           std::mutex* engine_mu) {
+    for (auto& entry : node->TakeCommitted()) {
+        if (entry.type != knot::raft::EntryType::kCommand) {
+            continue;
+        }
+        const auto cmd = knot::raft::DecodeCommand(entry.payload);
+        if (!cmd.has_value()) {
+            spdlog::warn("knotd: decode failed at idx={}", entry.index);
+            continue;
+        }
+        std::lock_guard<std::mutex> lk(*engine_mu);
+        std::visit(
+            [&](auto&& c) {
+                using T = std::decay_t<decltype(c)>;
+                if constexpr (std::is_same_v<T, knot::raft::PutCmd>) {
+                    engine->Put(c.key, c.value);
+                } else {
+                    engine->Delete(c.key);
+                }
+            },
+            *cmd);
+    }
 }
 
 }  // namespace
@@ -143,17 +186,40 @@ int main(int argc, char** argv) {
     auto transport =
         knot::raft::MakeTcpTransport(args.id, args.listen_host, args.listen_port, args.peers);
 
+    std::unique_ptr<knot::storage::StorageEngine> engine;
+    if (!args.data_dir.empty()) {
+        const auto storage_dir = std::filesystem::path(args.data_dir) / "storage";
+        engine = knot::storage::StorageEngine::Open({.data_dir = storage_dir});
+    }
+
+    std::mutex engine_mu;
+    std::mutex node_mu;  // guards all RaftNode access from any thread
+
+    std::unique_ptr<knot::server::ClientServer> client_server;
+    if (!args.client_listen_host.empty()) {
+        client_server =
+            knot::server::MakeClientServer(args.client_listen_host, args.client_listen_port,
+                                           node.get(), engine.get(), &node_mu, &engine_mu);
+        spdlog::info("knotd client RPC listening on {}:{}", args.client_listen_host,
+                     args.client_listen_port);
+    }
+
     spdlog::info("knotd up; entering driver loop");
 
     while (!g_shutdown_requested.load()) {
-        node->Tick();
-        for (auto& env : transport->Drain()) {
-            node->Step(env);
+        {
+            std::lock_guard<std::mutex> lk(node_mu);
+            node->Tick();
+            for (auto& env : transport->Drain()) {
+                node->Step(env);
+            }
+            for (auto& env : node->TakeOutgoing()) {
+                transport->Send(std::move(env));
+            }
+            if (engine) {
+                ApplyCommittedEntries(node.get(), engine.get(), &engine_mu);
+            }
         }
-        for (auto& env : node->TakeOutgoing()) {
-            transport->Send(std::move(env));
-        }
-        // Day 15: drain node->TakeCommitted() into the LSM engine.
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 

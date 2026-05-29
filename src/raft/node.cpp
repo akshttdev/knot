@@ -438,6 +438,10 @@ std::optional<LogIdx> RaftNode::Submit(EntryType type, std::string payload) {
         auto& ni = impl_->leader_state.next_index[peer];
         ni = std::max(ni, new_ni);
     }
+    // For single-node (or any case where quorum is already satisfied by
+    // the entries already acked), try to advance commit immediately.
+    // In a multi-node cluster this is a no-op until responses arrive.
+    impl_->MaybeAdvanceCommit();
     return impl_->log.LastIndex();
 }
 

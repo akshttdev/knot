@@ -64,6 +64,7 @@ add_library(knot_raft STATIC
     src/raft/persister.cpp
     src/raft/wire.cpp
     src/raft/tcp_transport.cpp
+    src/raft/command.cpp
 )
 target_include_directories(knot_raft PUBLIC include)
 target_compile_features(knot_raft PUBLIC cxx_std_20)
@@ -86,6 +87,14 @@ target_compile_features(knot_proto PUBLIC cxx_std_20)
 
 target_link_libraries(knot_raft PUBLIC knot_proto Boost::system)
 
+# knot_server — client-facing RPC server (Day 16)
+add_library(knot_server STATIC
+    src/server/client_server.cpp
+)
+target_include_directories(knot_server PUBLIC include)
+target_link_libraries(knot_server PUBLIC knot_raft knot_storage Boost::system)
+target_compile_features(knot_server PUBLIC cxx_std_20)
+
 # knotd — the server daemon
 add_executable(knotd
     src/server/main.cpp
@@ -94,9 +103,18 @@ target_include_directories(knotd PRIVATE include)
 target_link_libraries(knotd PRIVATE
     knot_storage
     knot_raft
+    knot_server
     spdlog::spdlog
     fmt::fmt
 )
+
+add_executable(knotctl src/cli/knotctl.cpp)
+target_link_libraries(knotctl PRIVATE
+    knot_proto
+    Boost::system
+)
+target_include_directories(knotctl PRIVATE include)
+target_compile_features(knotctl PRIVATE cxx_std_20)
 
 # ----------------------------------------------------------------------
 # Tests
@@ -183,6 +201,31 @@ target_link_libraries(raft_tcp_test PRIVATE
     GTest::gtest_main
 )
 gtest_discover_tests(raft_tcp_test)
+
+add_executable(raft_command_test tests/unit/raft_command_test.cpp)
+target_link_libraries(raft_command_test PRIVATE
+    knot_raft
+    GTest::gtest
+    GTest::gtest_main
+)
+gtest_discover_tests(raft_command_test)
+
+add_executable(raft_client_test tests/unit/raft_client_test.cpp)
+target_link_libraries(raft_client_test PRIVATE
+    knot_server
+    GTest::gtest
+    GTest::gtest_main
+)
+gtest_discover_tests(raft_client_test)
+
+add_executable(raft_e2e_test tests/unit/raft_e2e_test.cpp)
+target_link_libraries(raft_e2e_test PRIVATE
+    knot_server
+    knot_raft
+    GTest::gtest
+    GTest::gtest_main
+)
+gtest_discover_tests(raft_e2e_test)
 
 # ----------------------------------------------------------------------
 # Install (optional, defaults are fine for now)

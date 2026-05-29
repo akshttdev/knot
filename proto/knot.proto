@@ -88,3 +88,46 @@ message AppendEntriesResponse {
 }
 
 // InstallSnapshotRequest / Response will be added on Day 17.
+
+// -------------------------------------------------------------------------
+// Client RPCs (Day 16)
+// -------------------------------------------------------------------------
+
+message ClientPutRequest {
+  string client_id = 1;
+  uint64 seq_no    = 2;
+  bytes  key       = 3;
+  bytes  value     = 4;
+}
+
+message ClientPutResponse {
+  bool   success     = 1;
+  string leader_hint = 2;
+  string error       = 3;
+}
+
+message ClientGetRequest {
+  string client_id = 1;
+  uint64 seq_no    = 2;
+  bytes  key       = 3;
+}
+
+message ClientGetResponse {
+  bool   success     = 1;
+  string leader_hint = 2;
+  string error       = 3;
+  bool   found       = 4;
+  bytes  value       = 5;
+}
+
+message ClientDeleteRequest {
+  string client_id = 1;
+  uint64 seq_no    = 2;
+  bytes  key       = 3;
+}
+
+message ClientDeleteResponse {
+  bool   success     = 1;
+  string leader_hint = 2;
+  string error       = 3;
+}
