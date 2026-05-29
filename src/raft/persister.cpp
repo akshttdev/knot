@@ -187,8 +187,7 @@ public:
         (void)LoadLogOnly(&kept);
         // See MemoryPersister::TruncateLog above for the std::ranges note.
         const auto it = std::remove_if(  // NOLINT(modernize-use-ranges)
-            kept.begin(), kept.end(),
-            [from](const LogEntry& e) { return e.index >= from; });
+            kept.begin(), kept.end(), [from](const LogEntry& e) { return e.index >= from; });
         kept.erase(it, kept.end());
 
         const auto log_path = dir_ / "log.bin";

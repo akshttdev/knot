@@ -54,8 +54,36 @@ jobs:
       - name: Build
         run: cmake --build build/default --parallel
 
-      - name: Smoke test
-        run: ./build/default/knotd
+      - name: Run tests
+        run: ctest --test-dir build/default --output-on-failure
+
+      - name: knotd smoke test (start, send SIGTERM, expect clean exit)
+        run: |
+          rm -rf /tmp/knot-ci
+          ./build/default/knotd \
+              --id=ci --listen=127.0.0.1:17999 --data-dir=/tmp/knot-ci &
+          KNOTD_PID=$!
+          sleep 2
+          if ! kill -0 "$KNOTD_PID" 2>/dev/null; then
+            echo "FAIL: knotd died before SIGTERM"
+            exit 1
+          fi
+          kill -TERM "$KNOTD_PID"
+          # Give it up to 5s to shut down cleanly.
+          for _ in 1 2 3 4 5 6 7 8 9 10; do
+            if ! kill -0 "$KNOTD_PID" 2>/dev/null; then
+              break
+            fi
+            sleep 0.5
+          done
+          if kill -0 "$KNOTD_PID" 2>/dev/null; then
+            echo "FAIL: knotd did not shut down on SIGTERM"
+            kill -KILL "$KNOTD_PID"
+            exit 1
+          fi
+          wait "$KNOTD_PID" || true
+          echo "PASS: knotd started + shut down cleanly on SIGTERM"
+          rm -rf /tmp/knot-ci
 
   format:
     name: Format check
