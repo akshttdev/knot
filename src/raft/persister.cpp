@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cerrno>
 #include <cstdint>
 #include <filesystem>
@@ -25,9 +26,12 @@ public:
     void AppendLog(const LogEntry& entry) override { entries_.push_back(entry); }
 
     void TruncateLog(LogIdx from) override {
-        const auto removed =
-            std::ranges::remove_if(entries_, [from](const LogEntry& e) { return e.index >= from; });
-        entries_.erase(removed.begin(), removed.end());
+        // NOTE: std::ranges::remove_if isn't in Ubuntu CI's libstdc++ yet,
+        // so we use the C++17 iterator form here.
+        const auto it = std::remove_if(  // NOLINT(modernize-use-ranges)
+            entries_.begin(), entries_.end(),
+            [from](const LogEntry& e) { return e.index >= from; });
+        entries_.erase(it, entries_.end());
     }
 
     bool Load(PersistentState* out_state, std::vector<LogEntry>* out_entries) override {
@@ -181,9 +185,11 @@ public:
     void TruncateLog(LogIdx from) override {
         std::vector<LogEntry> kept;
         (void)LoadLogOnly(&kept);
-        const auto removed =
-            std::ranges::remove_if(kept, [from](const LogEntry& e) { return e.index >= from; });
-        kept.erase(removed.begin(), removed.end());
+        // See MemoryPersister::TruncateLog above for the std::ranges note.
+        const auto it = std::remove_if(  // NOLINT(modernize-use-ranges)
+            kept.begin(), kept.end(),
+            [from](const LogEntry& e) { return e.index >= from; });
+        kept.erase(it, kept.end());
 
         const auto log_path = dir_ / "log.bin";
         const auto tmp_path = dir_ / "log.bin.tmp";
