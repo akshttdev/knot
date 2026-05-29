@@ -39,12 +39,52 @@ enum EntryType {
 }
 
 // -------------------------------------------------------------------------
-// Raft RPCs — to be filled in Week 2
+// Raft RPCs (Day 14)
 // -------------------------------------------------------------------------
+//
+// `LogEntryProto` mirrors include/knot/raft/messages.h's LogEntry. Note
+// the `type` field is uint32 carrying the EntryType enum value (we use a
+// plain uint32 rather than the enum directly to keep the wire stable
+// across enum additions).
 
-// message RequestVoteRequest  { ... }
-// message RequestVoteResponse { ... }
-// message AppendEntriesRequest  { ... }
-// message AppendEntriesResponse { ... }
-// message InstallSnapshotRequest  { ... }
-// message InstallSnapshotResponse { ... }
+message RaftHandshake {
+  string sender_id = 1;
+}
+
+message LogEntryProto {
+  uint64 term     = 1;
+  uint64 index    = 2;
+  uint32 type     = 3;
+  bytes  payload  = 4;
+}
+
+message RequestVoteRequest {
+  uint64 term            = 1;
+  string candidate_id    = 2;
+  uint64 last_log_index  = 3;
+  uint64 last_log_term   = 4;
+}
+
+message RequestVoteResponse {
+  uint64 term         = 1;
+  bool   vote_granted = 2;
+}
+
+message AppendEntriesRequest {
+  uint64                  term            = 1;
+  string                  leader_id       = 2;
+  uint64                  prev_log_index  = 3;
+  uint64                  prev_log_term   = 4;
+  repeated LogEntryProto  entries         = 5;
+  uint64                  leader_commit   = 6;
+}
+
+message AppendEntriesResponse {
+  uint64 term            = 1;
+  bool   success         = 2;
+  uint64 match_index     = 3;
+  uint64 conflict_index  = 4;
+  uint64 conflict_term   = 5;
+}
+
+// InstallSnapshotRequest / Response will be added on Day 17.

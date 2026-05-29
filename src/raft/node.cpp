@@ -57,6 +57,9 @@ void RaftNode::Impl::BecomeFollower(Term new_term) {
     if (new_term > persistent.current_term) {
         persistent.current_term = new_term;
         persistent.voted_for.reset();
+        if (cfg.persister) {
+            cfg.persister->SaveState(persistent.current_term, persistent.voted_for);
+        }
     }
     votes_granted.clear();
     current_election_timeout = RollElectionTimeout();
@@ -71,6 +74,9 @@ void RaftNode::Impl::BecomeCandidate(const NodeId& self_id) {
     votes_granted = {self_id};
     current_election_timeout = RollElectionTimeout();
     ticks_since_last_heartbeat = 0;
+    if (cfg.persister) {
+        cfg.persister->SaveState(persistent.current_term, persistent.voted_for);
+    }
 }
 
 void RaftNode::Impl::BecomeLeader() {
@@ -82,6 +88,21 @@ void RaftNode::Impl::BecomeLeader() {
     for (const auto& peer : cfg.peers) {
         leader_state.next_index[peer] = log.LastIndex() + 1;
         leader_state.match_index[peer] = 0;
+    }
+    // §5.4.2: if the log has entries from a prior term, append a no-op in the
+    // current term so those prior-term entries get committed as a side-effect
+    // once this no-op reaches a quorum.  Fresh leaders (empty log or log already
+    // in current term) skip the no-op so the API surface stays predictable.
+    if (log.LastIndex() > 0 && log.LastTerm() < persistent.current_term) {
+        log.Append(persistent.current_term, EntryType::kNoop, "");
+        if (cfg.persister) {
+            cfg.persister->AppendLog(log.At(log.LastIndex()));
+        }
+        // Advance next_index past the no-op for all peers.
+        const LogIdx new_ni = log.LastIndex() + 1;
+        for (const auto& peer : cfg.peers) {
+            leader_state.next_index[peer] = std::max(leader_state.next_index[peer], new_ni);
+        }
     }
     BroadcastAppendEntries();
 }
@@ -135,6 +156,9 @@ void RaftNode::Impl::HandleRequestVote(const Envelope& env) {
         persistent.voted_for = req.candidate_id;
         ticks_since_last_heartbeat = 0;
         resp.vote_granted = true;
+        if (cfg.persister) {
+            cfg.persister->SaveState(persistent.current_term, persistent.voted_for);
+        }
     }
     resp.term = persistent.current_term;
     outgoing.push_back(Envelope{.from = cfg.self, .to = env.from, .msg = resp});
@@ -195,11 +219,13 @@ void RaftNode::Impl::HandleAppendEntries(const Envelope& env) {
 
     // Find first divergent entry; truncate + append from there.
     std::size_t first_new = 0;
+    bool truncated = false;
     for (std::size_t i = 0; i < req.entries.size(); ++i) {
         const LogIdx log_idx = req.prev_log_index + 1 + static_cast<LogIdx>(i);
         if (log.LastIndex() >= log_idx) {
             if (log.At(log_idx).term != req.entries[i].term) {
                 log.TruncateFrom(log_idx);
+                truncated = true;
                 first_new = i;
                 break;
             }
@@ -214,6 +240,14 @@ void RaftNode::Impl::HandleAppendEntries(const Envelope& env) {
         std::vector<LogEntry> to_append(
             req.entries.begin() + static_cast<std::ptrdiff_t>(first_new), req.entries.end());
         log.AppendBatch(to_append);
+    }
+    if (cfg.persister) {
+        if (truncated) {
+            cfg.persister->TruncateLog(req.prev_log_index + 1 + static_cast<LogIdx>(first_new));
+        }
+        for (std::size_t i = first_new; i < req.entries.size(); ++i) {
+            cfg.persister->AppendLog(req.entries[i]);
+        }
     }
 
     if (req.leader_commit > volatile_state.commit_index) {
@@ -309,6 +343,16 @@ std::unique_ptr<RaftNode> RaftNode::Create(Config cfg) {
         impl->rng.seed((static_cast<std::uint64_t>(rd()) << 32) | rd());
     }
     impl->current_election_timeout = impl->RollElectionTimeout();
+    if (impl->cfg.persister) {
+        PersistentState loaded;
+        std::vector<LogEntry> entries;
+        if (impl->cfg.persister->Load(&loaded, &entries)) {
+            impl->persistent = loaded;
+            if (!entries.empty()) {
+                impl->log.AppendBatch(entries);
+            }
+        }
+    }
     return std::unique_ptr<RaftNode>(new RaftNode(std::move(impl)));
 }
 
@@ -384,6 +428,9 @@ std::optional<LogIdx> RaftNode::Submit(EntryType type, std::string payload) {
         return std::nullopt;
     }
     impl_->log.Append(impl_->persistent.current_term, type, std::move(payload));
+    if (impl_->cfg.persister) {
+        impl_->cfg.persister->AppendLog(impl_->log.At(impl_->log.LastIndex()));
+    }
     impl_->BroadcastAppendEntries();
     // Optimistically advance next_index so back-off uses the correct baseline.
     const LogIdx new_ni = impl_->log.LastIndex() + 1;

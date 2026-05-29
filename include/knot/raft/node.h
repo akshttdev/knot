@@ -20,6 +20,7 @@
 #include <vector>
 
 #include <knot/raft/messages.h>
+#include <knot/raft/persister.h>
 #include <knot/raft/types.h>
 
 namespace knot::raft {
@@ -33,6 +34,7 @@ public:
         std::size_t election_timeout_max_ticks = 30;
         std::size_t heartbeat_interval_ticks = 5;
         std::optional<std::uint64_t> rng_seed;
+        std::shared_ptr<Persister> persister = nullptr;
     };
 
     [[nodiscard]] static std::unique_ptr<RaftNode> Create(Config cfg);

@@ -38,9 +38,8 @@ find_package(spdlog CONFIG REQUIRED)
 find_package(fmt    CONFIG REQUIRED)
 find_package(GTest  CONFIG REQUIRED)
 
-# Will add as we use them in later weeks:
-# find_package(Boost CONFIG REQUIRED COMPONENTS system)
-# find_package(Protobuf CONFIG REQUIRED)
+find_package(Boost CONFIG REQUIRED COMPONENTS system)
+find_package(Protobuf CONFIG REQUIRED)
 
 # ----------------------------------------------------------------------
 # Targets
@@ -62,9 +61,30 @@ add_library(knot_raft STATIC
     src/raft/log.cpp
     src/raft/transport.cpp
     src/raft/node.cpp
+    src/raft/persister.cpp
+    src/raft/wire.cpp
+    src/raft/tcp_transport.cpp
 )
 target_include_directories(knot_raft PUBLIC include)
 target_compile_features(knot_raft PUBLIC cxx_std_20)
+
+# knot_proto — generated protobuf C++ for inter-node RPCs (Day 14)
+set(PROTO_GEN_DIR ${CMAKE_CURRENT_BINARY_DIR}/proto_gen)
+file(MAKE_DIRECTORY ${PROTO_GEN_DIR})
+protobuf_generate(
+    LANGUAGE cpp
+    OUT_VAR  PROTO_SRCS
+    PROTOS   ${CMAKE_CURRENT_SOURCE_DIR}/proto/knot.proto
+    IMPORT_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/proto
+    PROTOC_OUT_DIR ${PROTO_GEN_DIR}
+)
+
+add_library(knot_proto STATIC ${PROTO_SRCS})
+target_include_directories(knot_proto PUBLIC ${PROTO_GEN_DIR})
+target_link_libraries(knot_proto PUBLIC protobuf::libprotobuf)
+target_compile_features(knot_proto PUBLIC cxx_std_20)
+
+target_link_libraries(knot_raft PUBLIC knot_proto Boost::system)
 
 # knotd — the server daemon
 add_executable(knotd
@@ -73,6 +93,7 @@ add_executable(knotd
 target_include_directories(knotd PRIVATE include)
 target_link_libraries(knotd PRIVATE
     knot_storage
+    knot_raft
     spdlog::spdlog
     fmt::fmt
 )
@@ -138,6 +159,30 @@ target_link_libraries(raft_node_test PRIVATE
     GTest::gtest_main
 )
 gtest_discover_tests(raft_node_test)
+
+add_executable(raft_persister_test tests/unit/raft_persister_test.cpp)
+target_link_libraries(raft_persister_test PRIVATE
+    knot_raft
+    GTest::gtest
+    GTest::gtest_main
+)
+gtest_discover_tests(raft_persister_test)
+
+add_executable(raft_wire_test tests/unit/raft_wire_test.cpp)
+target_link_libraries(raft_wire_test PRIVATE
+    knot_raft
+    GTest::gtest
+    GTest::gtest_main
+)
+gtest_discover_tests(raft_wire_test)
+
+add_executable(raft_tcp_test tests/unit/raft_tcp_test.cpp)
+target_link_libraries(raft_tcp_test PRIVATE
+    knot_raft
+    GTest::gtest
+    GTest::gtest_main
+)
+gtest_discover_tests(raft_tcp_test)
 
 # ----------------------------------------------------------------------
 # Install (optional, defaults are fine for now)

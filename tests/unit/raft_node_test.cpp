@@ -9,6 +9,7 @@
 
 #include <gtest/gtest.h>
 #include <knot/raft/node.h>
+#include <knot/raft/persister.h>
 #include <knot/raft/transport.h>
 
 using namespace knot::raft;
@@ -986,5 +987,158 @@ TEST(RaftNodeIntegrationTest, ThreeNodeReplicatesSubmittedEntryToAll) {
             << "node " << all[i] << " expected 1 committed entry, got " << applied.size();
         EXPECT_EQ(applied[0].payload, "hello");
         EXPECT_EQ(applied[0].index, 1U);
+    }
+}
+
+TEST(RaftNodeTest, RecoversTermAndLogFromPersister) {
+    auto persister = MakeMemoryPersister();
+    LogEntry e1{.term = 3, .index = 1, .type = EntryType::kCommand, .payload = "x"};
+    LogEntry e2{.term = 3, .index = 2, .type = EntryType::kCommand, .payload = "y"};
+    persister->SaveState(3U, std::nullopt);
+    persister->AppendLog(e1);
+    persister->AppendLog(e2);
+
+    auto n = RaftNode::Create({.self = "n", .peers = {"a"}, .rng_seed = 1, .persister = persister});
+    EXPECT_EQ(n->CurrentTerm(), 3U);
+    EXPECT_EQ(n->LastLogIndex(), 2U);
+}
+
+TEST(RaftNodeTest, PersistsTermAndVoteOnElection) {
+    auto persister = MakeMemoryPersister();
+    auto n = RaftNode::Create({.self = "a",
+                               .peers = {"b"},
+                               .election_timeout_min_ticks = 2,
+                               .election_timeout_max_ticks = 2,
+                               .rng_seed = 1,
+                               .persister = persister});
+    for (int i = 0; i < 2; ++i) {
+        n->Tick();
+    }
+    PersistentState s;
+    std::vector<LogEntry> es;
+    ASSERT_TRUE(persister->Load(&s, &es));
+    EXPECT_EQ(s.current_term, 1U);
+    ASSERT_TRUE(s.voted_for.has_value());
+    EXPECT_EQ(*s.voted_for, "a");
+}
+
+TEST(RaftNodeTest, PersistsLogOnLeaderSubmit) {
+    auto persister = MakeMemoryPersister();
+    auto n = RaftNode::Create({.self = "a",
+                               .peers = {"b"},
+                               .election_timeout_min_ticks = 2,
+                               .election_timeout_max_ticks = 2,
+                               .rng_seed = 1,
+                               .persister = persister});
+    for (int i = 0; i < 2; ++i) {
+        n->Tick();
+    }
+    n->Step(
+        Envelope{.from = "b", .to = "a", .msg = RequestVoteResp{.term = 1, .vote_granted = true}});
+    (void)n->TakeOutgoing();
+
+    (void)n->Submit(EntryType::kCommand, "hi");
+
+    PersistentState s;
+    std::vector<LogEntry> es;
+    ASSERT_TRUE(persister->Load(&s, &es));
+    ASSERT_EQ(es.size(), 1U);
+    EXPECT_EQ(es[0].payload, "hi");
+}
+
+TEST(RaftNodeIntegrationTest, ThreeNodeRestartsKeepsCommittedEntry) {
+    const std::vector<NodeId> all = {"n1", "n2", "n3"};
+    std::vector<std::shared_ptr<Persister>> persisters;
+    persisters.reserve(all.size());
+    for (std::size_t i = 0; i < all.size(); ++i) {
+        persisters.push_back(MakeMemoryPersister());
+    }
+
+    auto build_nodes = [&]() {
+        std::vector<std::unique_ptr<RaftNode>> nodes;
+        std::uint64_t seed = 100;
+        for (std::size_t i = 0; i < all.size(); ++i) {
+            std::vector<NodeId> peers;
+            for (const auto& other : all) {
+                if (other != all[i]) {
+                    peers.push_back(other);
+                }
+            }
+            nodes.push_back(RaftNode::Create({.self = all[i],
+                                              .peers = peers,
+                                              .election_timeout_min_ticks = 5,
+                                              .election_timeout_max_ticks = 15,
+                                              .heartbeat_interval_ticks = 2,
+                                              .rng_seed = seed++,
+                                              .persister = persisters[i]}));
+        }
+        return nodes;
+    };
+
+    // === First incarnation: elect a leader, Submit, commit, then teardown. ===
+    {
+        InMemoryBus bus;
+        auto nodes = build_nodes();
+        std::vector<std::unique_ptr<Transport>> transports;
+        transports.reserve(all.size());
+        for (const auto& id : all) {
+            transports.push_back(bus.Connect(id));
+        }
+
+        for (int t = 0; t < 60; ++t) {
+            for (std::size_t i = 0; i < nodes.size(); ++i) {
+                StepWorld(*nodes[i], *transports[i]);
+            }
+        }
+
+        RaftNode* leader = nullptr;
+        for (const auto& n : nodes) {
+            if (n->CurrentRole() == Role::kLeader) {
+                leader = n.get();
+                break;
+            }
+        }
+        ASSERT_NE(leader, nullptr);
+        const auto idx = leader->Submit(EntryType::kCommand, "durable");
+        ASSERT_TRUE(idx.has_value());
+
+        for (int t = 0; t < 30; ++t) {
+            for (std::size_t i = 0; i < nodes.size(); ++i) {
+                StepWorld(*nodes[i], *transports[i]);
+            }
+        }
+    }  // first incarnation destroyed here; persisters survive in `persisters`.
+
+    // === Recovery: rebuild nodes with the same persisters, fresh bus. ===
+    {
+        InMemoryBus bus2;
+        auto nodes = build_nodes();
+        std::vector<std::unique_ptr<Transport>> transports;
+        transports.reserve(all.size());
+        for (const auto& id : all) {
+            transports.push_back(bus2.Connect(id));
+        }
+
+        // Every recovered node should already see the entry in its log.
+        for (const auto& n : nodes) {
+            EXPECT_GE(n->LastLogIndex(), 1U) << "node " << n->Self() << " lost its log on restart";
+        }
+
+        for (int t = 0; t < 100; ++t) {
+            for (std::size_t i = 0; i < nodes.size(); ++i) {
+                StepWorld(*nodes[i], *transports[i]);
+            }
+        }
+
+        bool saw_durable = false;
+        for (const auto& n : nodes) {
+            auto applied = n->TakeCommitted();
+            for (const auto& e : applied) {
+                if (e.payload == "durable") {
+                    saw_durable = true;
+                }
+            }
+        }
+        EXPECT_TRUE(saw_durable) << "no node surfaced the durable entry after restart";
     }
 }
