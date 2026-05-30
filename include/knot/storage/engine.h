@@ -33,6 +33,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -64,6 +65,17 @@ public:
     StorageEngine& operator=(const StorageEngine&) = delete;
     StorageEngine(StorageEngine&&) = delete;
     StorageEngine& operator=(StorageEngine&&) = delete;
+
+    using ForEachCallback = std::function<void(std::string_view key, std::string_view value)>;
+
+    // Iterate every live key (newest-wins, tombstones skipped).
+    void ForEachLive(const ForEachCallback& cb) const;
+
+    // Serialize all live KVs to a single byte buffer. See spec for format.
+    [[nodiscard]] std::string Snapshot() const;
+
+    // Wipe current state + re-apply the records in `bytes`.
+    void ApplySnapshot(std::string_view bytes);
 
     void Put(std::string_view key, std::string_view value);
     void Delete(std::string_view key);

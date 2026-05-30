@@ -25,6 +25,8 @@ enum class WireTag : std::uint8_t {
     kRequestVoteResp = 0x02,
     kAppendEntriesReq = 0x03,
     kAppendEntriesResp = 0x04,
+    kInstallSnapshotReq = 0x05,
+    kInstallSnapshotResp = 0x06,
 };
 
 [[nodiscard]] std::vector<std::uint8_t> Encode(const Envelope& env);

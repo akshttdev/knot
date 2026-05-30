@@ -42,6 +42,9 @@ namespace {
 // NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 std::atomic<bool> g_shutdown_requested{false};
 
+// Day 17: compact the Raft log once more than this many entries accumulate.
+constexpr knot::raft::LogIdx kSnapshotThreshold = 1000;
+
 void HandleSignal(int /*sig*/) {
     g_shutdown_requested = true;
 }
@@ -180,12 +183,7 @@ int main(int argc, char** argv) {
         peer_ids.push_back(p.id);
     }
 
-    auto node =
-        knot::raft::RaftNode::Create({.self = args.id, .peers = peer_ids, .persister = persister});
-
-    auto transport =
-        knot::raft::MakeTcpTransport(args.id, args.listen_host, args.listen_port, args.peers);
-
+    // Open engine FIRST so apply_snapshot_callback can reference it.
     std::unique_ptr<knot::storage::StorageEngine> engine;
     if (!args.data_dir.empty()) {
         const auto storage_dir = std::filesystem::path(args.data_dir) / "storage";
@@ -194,6 +192,26 @@ int main(int argc, char** argv) {
 
     std::mutex engine_mu;
     std::mutex node_mu;  // guards all RaftNode access from any thread
+
+    // Build Config with apply_snapshot_callback baked in BEFORE Create().
+    knot::raft::RaftNode::Config cfg{
+        .self = args.id,
+        .peers = peer_ids,
+        .persister = persister,
+    };
+    if (engine) {
+        cfg.apply_snapshot_callback = [engine_ptr = engine.get(),
+                                       engine_mu_ptr = &engine_mu](std::string_view bytes) {
+            std::lock_guard<std::mutex> lk(*engine_mu_ptr);
+            engine_ptr->ApplySnapshot(bytes);
+        };
+    }
+
+    // Create node — its recovery path will invoke apply_snapshot_callback if needed.
+    auto node = knot::raft::RaftNode::Create(std::move(cfg));
+
+    auto transport =
+        knot::raft::MakeTcpTransport(args.id, args.listen_host, args.listen_port, args.peers);
 
     std::unique_ptr<knot::server::ClientServer> client_server;
     if (!args.client_listen_host.empty()) {
@@ -218,6 +236,27 @@ int main(int argc, char** argv) {
             }
             if (engine) {
                 ApplyCommittedEntries(node.get(), engine.get(), &engine_mu);
+
+                // Day 17: snapshot when log grows past threshold.
+                const auto applied_idx = node->CommitIndex();
+                const auto start_idx = node->LogStartIndex();
+                if (applied_idx >= start_idx && applied_idx - start_idx + 1 > kSnapshotThreshold) {
+                    std::string snap_bytes;
+                    {
+                        std::lock_guard<std::mutex> elk(engine_mu);
+                        snap_bytes = engine->Snapshot();
+                    }
+                    knot::raft::Term applied_term = 0;
+                    try {
+                        applied_term = node->TermAtIndex(applied_idx);
+                    } catch (...) {
+                        // Already snapshotted past this index — skip.
+                        applied_term = 0;
+                    }
+                    if (applied_term > 0) {
+                        node->MaybeCreateSnapshot(applied_idx, applied_term, snap_bytes);
+                    }
+                }
             }
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(10));

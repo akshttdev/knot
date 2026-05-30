@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <stdexcept>
 #include <utility>
 
@@ -31,60 +32,101 @@ void RaftLog::AppendBatch(const std::vector<LogEntry>& entries) {
 }
 
 const LogEntry& RaftLog::At(LogIdx index) const {
-    if (index == 0 || index > entries_.size()) {
-        throw std::out_of_range("RaftLog::At index out of range");
+    if (index < log_start_index_) {
+        throw std::out_of_range("RaftLog::At: index in snapshot");
     }
-    return entries_[index - 1];
+    const auto off = static_cast<std::size_t>(index - log_start_index_);
+    if (off >= entries_.size()) {
+        throw std::out_of_range("RaftLog::At: index out of range");
+    }
+    return entries_[off];
 }
 
 std::vector<LogEntry> RaftLog::Slice(LogIdx from, LogIdx to) const {
     if (from == 0) {
         return {};
     }
+    if (from < log_start_index_) {
+        throw std::out_of_range(
+            "RaftLog::Slice: from is in snapshot; caller must send InstallSnapshot");
+    }
     if (from >= to) {
         return {};
     }
-    LogIdx last = LastIndex();
+    const auto last = LastIndex();
     if (from > last) {
         return {};
     }
-    LogIdx end = (to - 1 > last) ? last : (to - 1);  // inclusive on disk
-
+    const auto end = (to > last + 1) ? (last + 1) : to;
     std::vector<LogEntry> out;
-    out.reserve(end - from + 1);
-    for (LogIdx i = from; i <= end; ++i) {
-        out.push_back(entries_[i - 1]);
+    out.reserve(static_cast<std::size_t>(end - from));
+    for (LogIdx i = from; i < end; ++i) {
+        out.push_back(entries_[static_cast<std::size_t>(i - log_start_index_)]);
     }
     return out;
 }
 
 void RaftLog::TruncateFrom(LogIdx from) {
-    if (from == 0 || from > entries_.size()) {
+    from = std::max(from, log_start_index_);
+    if (from > LastIndex()) {
         return;
     }
-    entries_.resize(from - 1);
+    const auto keep = static_cast<std::size_t>(from - log_start_index_);
+    entries_.resize(keep);
+}
+
+void RaftLog::TruncatePrefix(LogIdx through_idx, Term through_term) {
+    if (through_idx + 1 <= log_start_index_) {
+        return;  // already snapshotted past this point
+    }
+    if (through_idx >= LastIndex()) {
+        entries_.clear();
+        log_start_index_ = through_idx + 1;
+        log_start_term_ = through_term;
+        return;
+    }
+    const auto drop = static_cast<std::size_t>(through_idx - log_start_index_ + 1);
+    entries_.erase(entries_.begin(), entries_.begin() + static_cast<std::ptrdiff_t>(drop));
+    log_start_index_ = through_idx + 1;
+    log_start_term_ = through_term;
 }
 
 LogIdx RaftLog::LastIndex() const {
-    return entries_.empty() ? 0 : entries_.back().index;
+    if (entries_.empty()) {
+        return log_start_index_ - 1;
+    }
+    return entries_.back().index;
 }
 
 Term RaftLog::LastTerm() const {
-    return entries_.empty() ? 0 : entries_.back().term;
+    if (entries_.empty()) {
+        return log_start_term_;
+    }
+    return entries_.back().term;
 }
 
 bool RaftLog::Matches(LogIdx index, Term term) const {
     if (index == 0) {
         return term == 0;
     }
-    if (index > entries_.size()) {
+    if (index == log_start_index_ - 1) {
+        return term == log_start_term_;
+    }
+    if (index < log_start_index_ || index > LastIndex()) {
         return false;
     }
-    return entries_[index - 1].term == term;
+    return entries_[static_cast<std::size_t>(index - log_start_index_)].term == term;
 }
 
 std::size_t RaftLog::Size() const {
     return entries_.size();
+}
+
+LogIdx RaftLog::LogStartIndex() const {
+    return log_start_index_;
+}
+Term RaftLog::LogStartTerm() const {
+    return log_start_term_;
 }
 
 }  // namespace knot::raft

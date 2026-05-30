@@ -990,6 +990,143 @@ TEST(RaftNodeIntegrationTest, ThreeNodeReplicatesSubmittedEntryToAll) {
     }
 }
 
+TEST(RaftNodeTest, MaybeCreateSnapshotTruncatesLogAndPersists) {
+    auto persister = MakeMemoryPersister();
+    auto n = RaftNode::Create({.self = "s",
+                               .peers = {},
+                               .election_timeout_min_ticks = 2,
+                               .election_timeout_max_ticks = 2,
+                               .rng_seed = 1,
+                               .persister = persister});
+    // Become leader (single node self-elects).
+    for (int i = 0; i < 2; ++i) {
+        n->Tick();
+    }
+    ASSERT_EQ(n->CurrentRole(), Role::kLeader);
+    (void)n->TakeOutgoing();
+
+    for (int i = 0; i < 10; ++i) {
+        const auto idx = n->Submit(EntryType::kCommand, "x");
+        ASSERT_TRUE(idx.has_value());
+    }
+    (void)n->TakeOutgoing();
+
+    // Snapshot up to index 5.
+    n->MaybeCreateSnapshot(5, n->CurrentTerm(), "snap-bytes");
+
+    EXPECT_EQ(n->LogStartIndex(), 6U);
+    EXPECT_EQ(n->TermAtIndex(5), n->CurrentTerm());  // snapshot boundary sentinel
+
+    // Persister has the snapshot.
+    std::string b;
+    LogIdx idx = 0;
+    Term t = 0;
+    ASSERT_TRUE(persister->LoadSnapshot(&b, &idx, &t));
+    EXPECT_EQ(b, "snap-bytes");
+    EXPECT_EQ(idx, 5U);
+    EXPECT_EQ(t, n->CurrentTerm());
+}
+
+TEST(RaftNodeTest, LeaderSendsInstallSnapshotWhenPeerBehind) {
+    auto persister = MakeMemoryPersister();
+    auto n = RaftNode::Create({.self = "L",
+                               .peers = {"F"},
+                               .election_timeout_min_ticks = 2,
+                               .election_timeout_max_ticks = 2,
+                               .heartbeat_interval_ticks = 100,  // huge: don't auto-heartbeat
+                               .rng_seed = 1,
+                               .persister = persister});
+    // Become leader.
+    for (int i = 0; i < 2; ++i) {
+        n->Tick();
+    }
+    n->Step(
+        Envelope{.from = "F", .to = "L", .msg = RequestVoteResp{.term = 1, .vote_granted = true}});
+    ASSERT_EQ(n->CurrentRole(), Role::kLeader);
+
+    // Build leader's log + take a snapshot covering it.
+    for (int i = 0; i < 10; ++i) {
+        (void)n->Submit(EntryType::kCommand, "x");
+    }
+    n->MaybeCreateSnapshot(10, n->CurrentTerm(), "the-snapshot");
+    (void)n->TakeOutgoing();  // drain any pending sends
+
+    // Submit triggers a broadcast. Because log_start_index is now 11 and
+    // F's next_index is whatever it was before (some value <= 10), the
+    // broadcast must send InstallSnapshot to F.
+    (void)n->Submit(EntryType::kCommand, "y");
+    const auto out = n->TakeOutgoing();
+    bool saw_install = false;
+    for (const auto& env : out) {
+        if (env.to == "F" && std::holds_alternative<InstallSnapshotReq>(env.msg)) {
+            const auto& m = std::get<InstallSnapshotReq>(env.msg);
+            EXPECT_EQ(m.last_included_index, 10U);
+            EXPECT_EQ(m.data, "the-snapshot");
+            saw_install = true;
+        }
+    }
+    EXPECT_TRUE(saw_install) << "expected InstallSnapshotReq to F";
+}
+
+TEST(RaftNodeTest, FollowerAppliesInstallSnapshotInvokesCallback) {
+    auto persister = MakeMemoryPersister();
+    std::string captured;
+    auto n = RaftNode::Create(
+        {.self = "F",
+         .peers = {"L"},
+         .rng_seed = 1,
+         .persister = persister,
+         .apply_snapshot_callback = [&](std::string_view b) { captured = std::string(b); }});
+
+    n->Step(Envelope{.from = "L",
+                     .to = "F",
+                     .msg = InstallSnapshotReq{.term = 3,
+                                               .leader_id = "L",
+                                               .last_included_index = 42,
+                                               .last_included_term = 2,
+                                               .data = "snap-payload"}});
+
+    EXPECT_EQ(captured, "snap-payload");
+    EXPECT_EQ(n->LogStartIndex(), 43U);
+    EXPECT_EQ(n->CommitIndex(), 42U);
+
+    // Persister has the snapshot.
+    std::string b;
+    LogIdx idx = 0;
+    Term t = 0;
+    ASSERT_TRUE(persister->LoadSnapshot(&b, &idx, &t));
+    EXPECT_EQ(b, "snap-payload");
+    EXPECT_EQ(idx, 42U);
+    EXPECT_EQ(t, 2U);
+
+    // Follower replied.
+    const auto out = n->TakeOutgoing();
+    bool saw_resp = false;
+    for (const auto& env : out) {
+        if (env.to == "L" && std::holds_alternative<InstallSnapshotResp>(env.msg)) {
+            saw_resp = true;
+        }
+    }
+    EXPECT_TRUE(saw_resp);
+}
+
+TEST(RaftNodeTest, RecoversFromSnapshotOnCreate) {
+    auto persister = MakeMemoryPersister();
+    persister->SaveSnapshot("recovered-bytes", 99U, 7U);
+
+    std::string captured;
+    auto n = RaftNode::Create(
+        {.self = "n",
+         .peers = {},
+         .rng_seed = 1,
+         .persister = persister,
+         .apply_snapshot_callback = [&](std::string_view b) { captured = std::string(b); }});
+
+    EXPECT_EQ(captured, "recovered-bytes");
+    EXPECT_EQ(n->LogStartIndex(), 100U);
+    EXPECT_EQ(n->CommitIndex(), 99U);
+}
+
 TEST(RaftNodeTest, RecoversTermAndLogFromPersister) {
     auto persister = MakeMemoryPersister();
     LogEntry e1{.term = 3, .index = 1, .type = EntryType::kCommand, .payload = "x"};

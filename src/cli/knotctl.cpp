@@ -243,7 +243,7 @@ LoopResult RunWithRedirects(const std::vector<ServerEntry>& servers, std::uint8_
 
     std::size_t cursor = 0;  // index into servers for round-robin
     for (std::size_t hop = 0; hop < max_hops; ++hop) {
-        const ServerEntry target = servers[cursor];
+        const ServerEntry& target = servers[cursor];
         const auto outcome = AttemptRpc(target, req_tag, req_payload);
         if (outcome.rpc_ok && outcome.app_success) {
             LoopResult ok;
@@ -315,7 +315,7 @@ int DoGet(const std::vector<ServerEntry>& servers, const std::string& client_id,
         std::cerr << "knotctl: not found\n";
         return 1;
     }
-    std::cout.write(resp.value().data(), resp.value().size());
+    std::cout.write(resp.value().data(), static_cast<std::streamsize>(resp.value().size()));
     std::cout << "\n";
     return 0;
 }

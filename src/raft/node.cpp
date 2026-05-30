@@ -49,6 +49,8 @@ struct RaftNode::Impl {
     void HandleRequestVoteResp(const Envelope& env);
     void HandleAppendEntries(const Envelope& env);
     void HandleAppendEntriesResp(const Envelope& env);
+    void HandleInstallSnapshotResp(const Envelope& env);
+    void HandleInstallSnapshot(const Envelope& env);
     void MaybeAdvanceCommit();
 };
 
@@ -110,6 +112,32 @@ void RaftNode::Impl::BecomeLeader() {
 void RaftNode::Impl::BroadcastAppendEntries() {
     for (const auto& peer : cfg.peers) {
         const LogIdx ni = leader_state.next_index[peer];
+
+        // If the peer's next_index is at or before the snapshot's boundary,
+        // we don't have the entries in the log anymore — send the snapshot.
+        if (ni <= log.LogStartIndex() && cfg.persister) {
+            std::string snap_bytes;
+            LogIdx snap_idx = 0;
+            Term snap_term = 0;
+            if (cfg.persister->LoadSnapshot(&snap_bytes, &snap_idx, &snap_term)) {
+                outgoing.push_back(
+                    Envelope{.from = cfg.self,
+                             .to = peer,
+                             .msg = InstallSnapshotReq{.term = persistent.current_term,
+                                                       .leader_id = cfg.self,
+                                                       .last_included_index = snap_idx,
+                                                       .last_included_term = snap_term,
+                                                       .data = std::move(snap_bytes)}});
+                // Optimistic advance: assume the follower will accept.
+                // If they reject (higher term, etc), we'll step down at top of Step().
+                leader_state.next_index[peer] = snap_idx + 1;
+                leader_state.match_index[peer] = snap_idx;
+                continue;
+            }
+            // If we can't load a snapshot but we're past log_start, something's
+            // weird; fall through to the AE path which will likely also fail.
+        }
+
         const LogIdx prev_idx = (ni == 0) ? 0 : (ni - 1);
         const Term prev_term = (prev_idx == 0) ? 0 : log.At(prev_idx).term;
         std::vector<LogEntry> entries = log.Slice(ni, log.LastIndex() + 1);
@@ -265,6 +293,11 @@ void RaftNode::Impl::MaybeAdvanceCommit() {
         return;
     }
     for (LogIdx idx = log.LastIndex(); idx > volatile_state.commit_index; --idx) {
+        // Indices below log_start_index_ have already been snapshotted
+        // (hence committed); don't attempt to look them up in the log.
+        if (idx < log.LogStartIndex()) {
+            break;
+        }
         if (log.At(idx).term != persistent.current_term) {
             // §5.4.2: never commit by counting on a prior-term entry.
             // Keep scanning lower indices though — a higher index may
@@ -333,6 +366,54 @@ void RaftNode::Impl::HandleAppendEntriesResp(const Envelope& env) {
     }
 }
 
+void RaftNode::Impl::HandleInstallSnapshotResp(const Envelope& env) {
+    if (volatile_state.role != Role::kLeader) {
+        return;
+    }
+    const auto& resp = std::get<InstallSnapshotResp>(env.msg);
+    if (resp.term > persistent.current_term) {
+        // The higher-term step-down was already done at the top of Step().
+        return;
+    }
+    // Day 17: next_index/match_index were optimistically advanced when
+    // we sent the snapshot, so there's nothing more to do here. Day 19+
+    // could verify match_index more carefully.
+}
+
+void RaftNode::Impl::HandleInstallSnapshot(const Envelope& env) {
+    const auto& req = std::get<InstallSnapshotReq>(env.msg);
+    InstallSnapshotResp resp{.term = persistent.current_term};
+
+    if (req.term < persistent.current_term) {
+        outgoing.push_back(Envelope{.from = cfg.self, .to = env.from, .msg = resp});
+        return;
+    }
+
+    if (volatile_state.role == Role::kCandidate) {
+        BecomeFollower(req.term);
+    }
+    volatile_state.leader_id = req.leader_id;
+    ticks_since_last_heartbeat = 0;
+
+    // 1. Apply via FSM callback.
+    if (cfg.apply_snapshot_callback) {
+        cfg.apply_snapshot_callback(req.data);
+    }
+    // 2. Persist.
+    if (cfg.persister) {
+        cfg.persister->SaveSnapshot(req.data, req.last_included_index, req.last_included_term);
+    }
+    // 3. Truncate log.
+    log.TruncatePrefix(req.last_included_index, req.last_included_term);
+    // 4. Advance commit/applied.
+    volatile_state.commit_index = std::max(volatile_state.commit_index, req.last_included_index);
+    volatile_state.last_applied = std::max(volatile_state.last_applied, req.last_included_index);
+
+    resp.term = persistent.current_term;
+    outgoing.push_back(Envelope{.from = cfg.self, .to = env.from, .msg = resp});
+}
+
+// NOLINTNEXTLINE(readability-function-cognitive-complexity)
 std::unique_ptr<RaftNode> RaftNode::Create(Config cfg) {
     auto impl = std::make_unique<Impl>();
     impl->cfg = std::move(cfg);
@@ -344,12 +425,38 @@ std::unique_ptr<RaftNode> RaftNode::Create(Config cfg) {
     }
     impl->current_election_timeout = impl->RollElectionTimeout();
     if (impl->cfg.persister) {
+        // 1. Load snapshot FIRST (if any). This sets the log's start
+        // index so subsequent log entries can be filtered.
+        std::string snap_bytes;
+        LogIdx snap_idx = 0;
+        Term snap_term = 0;
+        if (impl->cfg.persister->LoadSnapshot(&snap_bytes, &snap_idx, &snap_term)) {
+            if (impl->cfg.apply_snapshot_callback) {
+                impl->cfg.apply_snapshot_callback(snap_bytes);
+            }
+            impl->log.TruncatePrefix(snap_idx, snap_term);
+            impl->volatile_state.commit_index = snap_idx;
+            impl->volatile_state.last_applied = snap_idx;
+        }
+
+        // 2. Load persistent state + log entries.
         PersistentState loaded;
         std::vector<LogEntry> entries;
         if (impl->cfg.persister->Load(&loaded, &entries)) {
             impl->persistent = loaded;
             if (!entries.empty()) {
-                impl->log.AppendBatch(entries);
+                // Filter out entries already covered by the snapshot.
+                const LogIdx start = impl->log.LogStartIndex();
+                std::vector<LogEntry> post_snap;
+                post_snap.reserve(entries.size());
+                for (auto& e : entries) {
+                    if (e.index >= start) {
+                        post_snap.push_back(std::move(e));
+                    }
+                }
+                if (!post_snap.empty()) {
+                    impl->log.AppendBatch(post_snap);
+                }
             }
         }
     }
@@ -402,6 +509,10 @@ void RaftNode::Step(const Envelope& env) {
                 impl_->HandleRequestVoteResp(env);
             } else if constexpr (std::is_same_v<T, AppendEntriesResp>) {
                 impl_->HandleAppendEntriesResp(env);
+            } else if constexpr (std::is_same_v<T, InstallSnapshotResp>) {
+                impl_->HandleInstallSnapshotResp(env);
+            } else if constexpr (std::is_same_v<T, InstallSnapshotReq>) {
+                impl_->HandleInstallSnapshot(env);
             }
         },
         env.msg);
@@ -421,6 +532,32 @@ std::vector<LogEntry> RaftNode::TakeCommitted() {
                                                  impl_->volatile_state.commit_index + 1);
     impl_->volatile_state.last_applied = impl_->volatile_state.commit_index;
     return out;
+}
+
+void RaftNode::MaybeCreateSnapshot(LogIdx last_included_index, Term last_included_term,
+                                   std::string_view snapshot_bytes) {
+    if (!impl_->cfg.persister) {
+        return;  // no persistence, no snapshot
+    }
+    if (last_included_index + 1 <= impl_->log.LogStartIndex()) {
+        return;  // already snapshotted past this point
+    }
+    impl_->cfg.persister->SaveSnapshot(snapshot_bytes, last_included_index, last_included_term);
+    impl_->log.TruncatePrefix(last_included_index, last_included_term);
+}
+
+LogIdx RaftNode::LogStartIndex() const {
+    return impl_->log.LogStartIndex();
+}
+
+Term RaftNode::TermAtIndex(LogIdx idx) const {
+    if (idx == 0) {
+        return 0;
+    }
+    if (idx == impl_->log.LogStartIndex() - 1) {
+        return impl_->log.LogStartTerm();
+    }
+    return impl_->log.At(idx).term;
 }
 
 std::optional<LogIdx> RaftNode::Submit(EntryType type, std::string payload) {

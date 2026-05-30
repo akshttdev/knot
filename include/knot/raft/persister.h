@@ -9,6 +9,7 @@
 #include <filesystem>
 #include <memory>
 #include <optional>
+#include <string_view>
 #include <vector>
 
 #include <knot/raft/state.h>
@@ -33,6 +34,15 @@ public:
 
     [[nodiscard]] virtual bool Load(PersistentState* out_state,
                                     std::vector<LogEntry>* out_entries) = 0;
+
+    // Save the snapshot atomically. last_included_index is the last log
+    // index covered by this snapshot; last_included_term is its term.
+    virtual void SaveSnapshot(std::string_view bytes, LogIdx last_included_index,
+                              Term last_included_term) = 0;
+
+    // Load snapshot if one exists. Returns false on missing/corrupt.
+    [[nodiscard]] virtual bool LoadSnapshot(std::string* out_bytes, LogIdx* out_index,
+                                            Term* out_term) = 0;
 
 protected:
     Persister() = default;

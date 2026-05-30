@@ -15,8 +15,10 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
+#include <string_view>
 #include <vector>
 
 #include <knot/raft/messages.h>
@@ -35,6 +37,11 @@ public:
         std::size_t heartbeat_interval_ticks = 5;
         std::optional<std::uint64_t> rng_seed;
         std::shared_ptr<Persister> persister = nullptr;
+
+        // Day 17: called by HandleInstallSnapshot (Task G) and Create's
+        // recovery path (Task I) so the FSM (e.g., StorageEngine) can
+        // re-apply the snapshot bytes.
+        std::function<void(std::string_view bytes)> apply_snapshot_callback;
     };
 
     [[nodiscard]] static std::unique_ptr<RaftNode> Create(Config cfg);
@@ -51,6 +58,19 @@ public:
     [[nodiscard]] std::vector<Envelope> TakeOutgoing();
     [[nodiscard]] std::vector<LogEntry> TakeCommitted();  // Day 8: always empty
     [[nodiscard]] std::optional<LogIdx> Submit(EntryType type, std::string payload);
+
+    // Tell the log a snapshot has been taken up to `last_included_index`,
+    // covering the entry at that index with term `last_included_term`.
+    // The Raft log truncates entries <= last_included_index. The
+    // persister saves `snapshot_bytes` for restart.
+    void MaybeCreateSnapshot(LogIdx last_included_index, Term last_included_term,
+                             std::string_view snapshot_bytes);
+
+    [[nodiscard]] LogIdx LogStartIndex() const;
+
+    // Term of the entry at `idx`. Handles the snapshot-boundary sentinel
+    // (`idx == LogStartIndex() - 1` returns the snapshot's last_included_term).
+    [[nodiscard]] Term TermAtIndex(LogIdx idx) const;
 
     [[nodiscard]] const NodeId& Self() const;
     [[nodiscard]] Role CurrentRole() const;

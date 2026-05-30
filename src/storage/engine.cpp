@@ -1,7 +1,9 @@
 #include <algorithm>
 #include <cerrno>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <map>
 #include <stdexcept>
 #include <string>
 #include <system_error>
@@ -336,6 +338,103 @@ StorageEngine::GetResult StorageEngine::Get(std::string_view key, std::string* v
         }
     }
     return GetResult::kNotFound;
+}
+
+void StorageEngine::ForEachLive(const ForEachCallback& cb) const {
+    std::lock_guard<std::mutex> lk(mutex_);
+
+    // Dedup by key; newest-first wins.
+    // value: (string value, bool is_tombstone)
+    std::map<std::string, std::pair<std::string, bool>> seen;
+
+    // Walk MemTable first (newest).
+    auto m_it = memtable_->NewIterator();
+    while (m_it->Valid()) {
+        std::string key(m_it->Key());
+        if (seen.find(key) == seen.end()) {
+            seen.emplace(std::move(key),
+                         std::make_pair(std::string(m_it->Value()), m_it->IsTombstone()));
+        }
+        m_it->Next();
+    }
+
+    // Walk SSTables (sstables_ is newest-first).
+    for (const auto& sst : sstables_) {
+        auto s_it = sst.reader->NewIterator();
+        while (s_it->Valid()) {
+            std::string key(s_it->Key());
+            if (seen.find(key) == seen.end()) {
+                seen.emplace(std::move(key),
+                             std::make_pair(std::string(s_it->Value()), s_it->IsTombstone()));
+            }
+            s_it->Next();
+        }
+    }
+
+    // Emit non-tombstone entries in key order.
+    for (const auto& [k, vt] : seen) {
+        if (!vt.second) {
+            cb(k, vt.first);
+        }
+    }
+}
+
+std::string StorageEngine::Snapshot() const {
+    std::string out;
+    auto put_be32 = [&](std::uint32_t v) {
+        out.push_back(static_cast<char>((v >> 24) & 0xFFU));
+        out.push_back(static_cast<char>((v >> 16) & 0xFFU));
+        out.push_back(static_cast<char>((v >> 8) & 0xFFU));
+        out.push_back(static_cast<char>(v & 0xFFU));
+    };
+    ForEachLive([&](std::string_view k, std::string_view v) {
+        put_be32(static_cast<std::uint32_t>(k.size()));
+        out.append(k);
+        put_be32(static_cast<std::uint32_t>(v.size()));
+        out.append(v);
+    });
+    return out;
+}
+
+void StorageEngine::ApplySnapshot(std::string_view bytes) {
+    std::lock_guard<std::mutex> lk(mutex_);
+
+    // Wipe in-memory state.
+    memtable_ = std::make_unique<MemTable>();
+    sstables_.clear();
+    next_sst_id_ = 1;
+    last_seq_in_sstables_ = 0;
+    next_seq_ = 1;
+
+    // Decode + re-Put each record directly into MemTable bypassing WAL.
+    auto get_be32 = [&](std::size_t o) -> std::uint32_t {
+        return (static_cast<std::uint32_t>(static_cast<unsigned char>(bytes[o])) << 24) |
+               (static_cast<std::uint32_t>(static_cast<unsigned char>(bytes[o + 1])) << 16) |
+               (static_cast<std::uint32_t>(static_cast<unsigned char>(bytes[o + 2])) << 8) |
+               static_cast<std::uint32_t>(static_cast<unsigned char>(bytes[o + 3]));
+    };
+
+    std::size_t off = 0;
+    while (off + 4 <= bytes.size()) {
+        const std::uint32_t klen = get_be32(off);
+        off += 4;
+        if (off + klen > bytes.size()) {
+            break;
+        }
+        std::string key(bytes.data() + off, klen);
+        off += klen;
+        if (off + 4 > bytes.size()) {
+            break;
+        }
+        const std::uint32_t vlen = get_be32(off);
+        off += 4;
+        if (off + vlen > bytes.size()) {
+            break;
+        }
+        std::string value(bytes.data() + off, vlen);
+        off += vlen;
+        memtable_->Put(next_seq_++, key, value);
+    }
 }
 
 void StorageEngine::Flush() {

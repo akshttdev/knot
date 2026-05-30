@@ -38,7 +38,20 @@ struct AppendEntriesResp {
     Term conflict_term = 0;     // Day 12: term at conflict_index
 };
 
-using Message = std::variant<RequestVoteReq, RequestVoteResp, AppendEntriesReq, AppendEntriesResp>;
+struct InstallSnapshotReq {
+    Term term;
+    NodeId leader_id;
+    LogIdx last_included_index;
+    Term last_included_term;
+    std::string data;
+};
+
+struct InstallSnapshotResp {
+    Term term;
+};
+
+using Message = std::variant<RequestVoteReq, RequestVoteResp, AppendEntriesReq, AppendEntriesResp,
+                             InstallSnapshotReq, InstallSnapshotResp>;
 
 // Address-bearing wrapper. Transport speaks in envelopes.
 struct Envelope {

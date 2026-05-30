@@ -135,6 +135,41 @@ TEST(FilePersisterTest, LogRoundtripPersistsAcrossInstances) {
     std::filesystem::remove_all(dir);
 }
 
+TEST(MemoryPersisterTest, SnapshotRoundtrip) {
+    auto p = MakeMemoryPersister();
+    p->SaveSnapshot("hello-snap", 100U, 7U);
+
+    std::string b;
+    LogIdx i = 0;
+    Term t = 0;
+    ASSERT_TRUE(p->LoadSnapshot(&b, &i, &t));
+    EXPECT_EQ(b, "hello-snap");
+    EXPECT_EQ(i, 100U);
+    EXPECT_EQ(t, 7U);
+}
+
+TEST(FilePersisterTest, SnapshotPersistsAcrossInstances) {
+    const auto dir = UniqueTempDir("knot_filepers_snap");
+
+    {
+        auto p = MakeFilePersister(dir);
+        p->SaveSnapshot("snap-data", 42U, 5U);
+    }
+
+    {
+        auto p = MakeFilePersister(dir);
+        std::string b;
+        LogIdx i = 0;
+        Term t = 0;
+        ASSERT_TRUE(p->LoadSnapshot(&b, &i, &t));
+        EXPECT_EQ(b, "snap-data");
+        EXPECT_EQ(i, 42U);
+        EXPECT_EQ(t, 5U);
+    }
+
+    std::filesystem::remove_all(dir);
+}
+
 TEST(FilePersisterTest, TruncateDropsSuffixOnDisk) {
     const auto dir = UniqueTempDir("knot_filepers_trunc");
 

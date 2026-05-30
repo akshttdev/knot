@@ -279,3 +279,325 @@ TEST(RaftEndToEndTest, ThreeNodePutAndGetOverClientRpc) {
         b->cs.reset();
     }
 }
+
+TEST(RaftEndToEndTest, SnapshotPersistsAcrossClusterRestart) {
+    const std::vector<NodeId> ids = {"n1", "n2", "n3"};
+
+    // Pre-create temp data dirs that survive across "restarts".
+    std::vector<std::filesystem::path> data_dirs;
+    data_dirs.reserve(3);
+    for (std::size_t i = 0; i < 3; ++i) {
+        const auto d =
+            std::filesystem::temp_directory_path() /
+            ("knot_snap_e2e_" + std::to_string(i) + "_" +
+             std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+        std::filesystem::create_directories(d);
+        data_dirs.push_back(d);
+    }
+
+    // === Phase 1: bring up cluster, Put 50 keys, snapshot, tear down. ===
+    constexpr int kNumKeys = 50;
+    int leader_phase1 = -1;
+
+    {
+        auto ports = PickFreePorts(6);
+        const std::array<std::uint16_t, 3> p_node = {ports[0], ports[1], ports[2]};
+        const std::array<std::uint16_t, 3> p_cli = {ports[3], ports[4], ports[5]};
+
+        struct Bundle {
+            std::shared_ptr<knot::raft::Persister> persister;
+            std::unique_ptr<knot::storage::StorageEngine> engine;
+            std::unique_ptr<RaftNode> node;
+            std::unique_ptr<Transport> transport;
+            std::mutex node_mu;
+            std::mutex engine_mu;
+            std::unique_ptr<ClientServer> cs;
+            std::atomic<bool> stop{false};
+            std::thread driver;
+        };
+
+        std::vector<std::unique_ptr<Bundle>> bundles;
+        bundles.reserve(3);
+        for (std::size_t i = 0; i < 3; ++i) {
+            bundles.push_back(std::make_unique<Bundle>());
+        }
+
+        for (std::size_t i = 0; i < 3; ++i) {
+            auto& b = *bundles[i];
+            b.persister = knot::raft::MakeFilePersister(data_dirs[i]);
+            b.engine = knot::storage::StorageEngine::Open({.data_dir = data_dirs[i] / "storage"});
+
+            std::vector<PeerEndpoint> peers;
+            std::vector<NodeId> peer_ids;
+            for (std::size_t j = 0; j < 3; ++j) {
+                if (j == i) {
+                    continue;
+                }
+                peers.push_back({.id = ids[j], .host = "127.0.0.1", .port = p_node[j]});
+                peer_ids.push_back(ids[j]);
+            }
+
+            knot::raft::RaftNode::Config cfg{
+                .self = ids[i],
+                .peers = peer_ids,
+                .election_timeout_min_ticks = 5,
+                .election_timeout_max_ticks = 15,
+                .heartbeat_interval_ticks = 2,
+                .rng_seed = 100U + i,
+                .persister = b.persister,
+            };
+            auto* engine_ptr = b.engine.get();
+            auto* engine_mu_ptr = &b.engine_mu;
+            cfg.apply_snapshot_callback = [engine_ptr, engine_mu_ptr](std::string_view bytes) {
+                std::lock_guard<std::mutex> lk(*engine_mu_ptr);
+                engine_ptr->ApplySnapshot(bytes);
+            };
+            b.node = RaftNode::Create(cfg);
+            b.transport = MakeTcpTransport(ids[i], "127.0.0.1", p_node[i], peers);
+            b.cs = MakeClientServer("127.0.0.1", p_cli[i], b.node.get(), b.engine.get(), &b.node_mu,
+                                    &b.engine_mu);
+
+            b.driver = std::thread([&b]() {
+                while (!b.stop.load()) {
+                    {
+                        std::lock_guard<std::mutex> lk(b.node_mu);
+                        b.node->Tick();
+                        for (auto& env : b.transport->Drain()) {
+                            b.node->Step(env);
+                        }
+                        for (auto& env : b.node->TakeOutgoing()) {
+                            b.transport->Send(std::move(env));
+                        }
+                        auto committed = b.node->TakeCommitted();
+                        if (!committed.empty()) {
+                            std::lock_guard<std::mutex> elk(b.engine_mu);
+                            for (const auto& entry : committed) {
+                                if (entry.type != EntryType::kCommand) {
+                                    continue;
+                                }
+                                auto cmd = knot::raft::DecodeCommand(entry.payload);
+                                if (!cmd.has_value()) {
+                                    continue;
+                                }
+                                if (std::holds_alternative<knot::raft::PutCmd>(*cmd)) {
+                                    const auto& p = std::get<knot::raft::PutCmd>(*cmd);
+                                    b.engine->Put(p.key, p.value);
+                                } else {
+                                    const auto& d = std::get<knot::raft::DeleteCmd>(*cmd);
+                                    b.engine->Delete(d.key);
+                                }
+                            }
+                        }
+                    }
+                    std::this_thread::sleep_for(10ms);
+                }
+            });
+        }
+
+        // Wait for a leader.
+        const auto leader_deadline = std::chrono::steady_clock::now() + 5s;
+        while (std::chrono::steady_clock::now() < leader_deadline && leader_phase1 < 0) {
+            for (std::size_t i = 0; i < 3; ++i) {
+                std::lock_guard<std::mutex> lk(bundles[i]->node_mu);
+                if (bundles[i]->node->CurrentRole() == Role::kLeader) {
+                    leader_phase1 = static_cast<int>(i);
+                    break;
+                }
+            }
+            if (leader_phase1 < 0) {
+                std::this_thread::sleep_for(50ms);
+            }
+        }
+        ASSERT_GE(leader_phase1, 0) << "no leader in 5s";
+
+        // Put 50 keys via client RPC to the leader.
+        for (int k = 0; k < kNumKeys; ++k) {
+            knot::rpc::ClientPutRequest req;
+            req.set_client_id("snap-test");
+            req.set_seq_no(static_cast<std::uint64_t>(k) + 1U);
+            req.set_key("k" + std::to_string(k));
+            req.set_value("v" + std::to_string(k));
+            std::string buf;
+            req.SerializeToString(&buf);
+            auto r = SyncRpc(p_cli[leader_phase1], kPutReq, buf);
+            ASSERT_TRUE(r.has_value()) << "put " << k << " failed";
+        }
+
+        // Wait for the cluster to fully apply.
+        std::this_thread::sleep_for(300ms);
+
+        // Manually snapshot the leader.
+        {
+            auto& lead = *bundles[leader_phase1];
+            std::string snap;
+            {
+                std::lock_guard<std::mutex> elk(lead.engine_mu);
+                snap = lead.engine->Snapshot();
+            }
+            std::lock_guard<std::mutex> lk(lead.node_mu);
+            const auto applied = lead.node->CommitIndex();
+            const auto term = lead.node->TermAtIndex(applied);
+            lead.node->MaybeCreateSnapshot(applied, term, snap);
+        }
+
+        // Drive a few more ticks so followers receive any subsequent AE/IS.
+        std::this_thread::sleep_for(300ms);
+
+        // Tear down.
+        for (auto& b : bundles) {
+            b->stop.store(true);
+            if (b->driver.joinable()) {
+                b->driver.join();
+            }
+        }
+    }  // bundles destroyed; persisters' data on disk survives.
+
+    // === Phase 2: bring up 3 fresh nodes from the same data dirs. ===
+    int leader_phase2 = -1;
+    {
+        auto ports = PickFreePorts(6);
+        const std::array<std::uint16_t, 3> p_node = {ports[0], ports[1], ports[2]};
+        const std::array<std::uint16_t, 3> p_cli = {ports[3], ports[4], ports[5]};
+
+        struct Bundle {
+            std::shared_ptr<knot::raft::Persister> persister;
+            std::unique_ptr<knot::storage::StorageEngine> engine;
+            std::unique_ptr<RaftNode> node;
+            std::unique_ptr<Transport> transport;
+            std::mutex node_mu;
+            std::mutex engine_mu;
+            std::unique_ptr<ClientServer> cs;
+            std::atomic<bool> stop{false};
+            std::thread driver;
+        };
+
+        std::vector<std::unique_ptr<Bundle>> bundles;
+        bundles.reserve(3);
+        for (std::size_t i = 0; i < 3; ++i) {
+            bundles.push_back(std::make_unique<Bundle>());
+        }
+
+        for (std::size_t i = 0; i < 3; ++i) {
+            auto& b = *bundles[i];
+            b.persister = knot::raft::MakeFilePersister(data_dirs[i]);
+            b.engine = knot::storage::StorageEngine::Open({.data_dir = data_dirs[i] / "storage"});
+
+            std::vector<PeerEndpoint> peers;
+            std::vector<NodeId> peer_ids;
+            for (std::size_t j = 0; j < 3; ++j) {
+                if (j == i) {
+                    continue;
+                }
+                peers.push_back({.id = ids[j], .host = "127.0.0.1", .port = p_node[j]});
+                peer_ids.push_back(ids[j]);
+            }
+
+            knot::raft::RaftNode::Config cfg{
+                .self = ids[i],
+                .peers = peer_ids,
+                .election_timeout_min_ticks = 5,
+                .election_timeout_max_ticks = 15,
+                .heartbeat_interval_ticks = 2,
+                .rng_seed = 200U + i,
+                .persister = b.persister,
+            };
+            auto* engine_ptr = b.engine.get();
+            auto* engine_mu_ptr = &b.engine_mu;
+            cfg.apply_snapshot_callback = [engine_ptr, engine_mu_ptr](std::string_view bytes) {
+                std::lock_guard<std::mutex> lk(*engine_mu_ptr);
+                engine_ptr->ApplySnapshot(bytes);
+            };
+            b.node = RaftNode::Create(cfg);
+            b.transport = MakeTcpTransport(ids[i], "127.0.0.1", p_node[i], peers);
+            b.cs = MakeClientServer("127.0.0.1", p_cli[i], b.node.get(), b.engine.get(), &b.node_mu,
+                                    &b.engine_mu);
+
+            b.driver = std::thread([&b]() {
+                while (!b.stop.load()) {
+                    {
+                        std::lock_guard<std::mutex> lk(b.node_mu);
+                        b.node->Tick();
+                        for (auto& env : b.transport->Drain()) {
+                            b.node->Step(env);
+                        }
+                        for (auto& env : b.node->TakeOutgoing()) {
+                            b.transport->Send(std::move(env));
+                        }
+                        auto committed = b.node->TakeCommitted();
+                        if (!committed.empty()) {
+                            std::lock_guard<std::mutex> elk(b.engine_mu);
+                            for (const auto& entry : committed) {
+                                if (entry.type != EntryType::kCommand) {
+                                    continue;
+                                }
+                                auto cmd = knot::raft::DecodeCommand(entry.payload);
+                                if (!cmd.has_value()) {
+                                    continue;
+                                }
+                                if (std::holds_alternative<knot::raft::PutCmd>(*cmd)) {
+                                    const auto& p = std::get<knot::raft::PutCmd>(*cmd);
+                                    b.engine->Put(p.key, p.value);
+                                } else {
+                                    const auto& d = std::get<knot::raft::DeleteCmd>(*cmd);
+                                    b.engine->Delete(d.key);
+                                }
+                            }
+                        }
+                    }
+                    std::this_thread::sleep_for(10ms);
+                }
+            });
+        }
+
+        // Wait for a leader.
+        const auto leader_deadline = std::chrono::steady_clock::now() + 5s;
+        while (std::chrono::steady_clock::now() < leader_deadline && leader_phase2 < 0) {
+            for (std::size_t i = 0; i < 3; ++i) {
+                std::lock_guard<std::mutex> lk(bundles[i]->node_mu);
+                if (bundles[i]->node->CurrentRole() == Role::kLeader) {
+                    leader_phase2 = static_cast<int>(i);
+                    break;
+                }
+            }
+            if (leader_phase2 < 0) {
+                std::this_thread::sleep_for(50ms);
+            }
+        }
+        ASSERT_GE(leader_phase2, 0) << "no leader in phase 2 within 5s";
+
+        // Allow extra time for the cluster to stabilize after restart.
+        std::this_thread::sleep_for(500ms);
+
+        // Verify all 50 keys are still readable via the leader.
+        for (int k = 0; k < kNumKeys; ++k) {
+            knot::rpc::ClientGetRequest req;
+            req.set_client_id("verify");
+            req.set_seq_no(static_cast<std::uint64_t>(k) + 1U);
+            req.set_key("k" + std::to_string(k));
+            std::string buf;
+            req.SerializeToString(&buf);
+            auto r = SyncRpc(p_cli[leader_phase2], kGetReq, buf);
+            ASSERT_TRUE(r.has_value()) << "get " << k << " failed (no response)";
+            ASSERT_EQ(r->tag, kGetResp) << "get " << k << " unexpected tag";
+            knot::rpc::ClientGetResponse resp;
+            ASSERT_TRUE(resp.ParseFromString(r->payload));
+            EXPECT_TRUE(resp.success()) << "get " << k << " response not success";
+            EXPECT_TRUE(resp.found()) << "key k" << k << " not found after restart";
+            EXPECT_EQ(resp.value(), "v" + std::to_string(k)) << "wrong value for k" << k;
+        }
+
+        // Tear down.
+        for (auto& b : bundles) {
+            b->stop.store(true);
+            if (b->driver.joinable()) {
+                b->driver.join();
+            }
+        }
+    }
+
+    // Cleanup temp dirs.
+    for (const auto& d : data_dirs) {
+        std::error_code ec;
+        std::filesystem::remove_all(d, ec);
+    }
+}

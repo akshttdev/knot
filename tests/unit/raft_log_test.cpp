@@ -163,3 +163,36 @@ TEST(RaftLogTest, AppendBatchEmptyIsNoOp) {
     log.AppendBatch({});
     EXPECT_EQ(log.Size(), 1U);
 }
+
+TEST(RaftLogTest, TruncatePrefixDropsEntriesUpToInclusive) {
+    RaftLog log;
+    for (int i = 0; i < 5; ++i) {
+        log.Append(1, EntryType::kCommand, "x");
+    }
+    log.TruncatePrefix(3, 1);
+    EXPECT_EQ(log.LogStartIndex(), 4U);
+    EXPECT_EQ(log.LastIndex(), 5U);
+    EXPECT_EQ(log.At(4).index, 4U);
+    EXPECT_EQ(log.At(5).index, 5U);
+}
+
+TEST(RaftLogTest, MatchesAtPrefixSentinelReturnsTrue) {
+    RaftLog log;
+    for (int i = 0; i < 5; ++i) {
+        log.Append(1, EntryType::kCommand, "x");
+    }
+    log.TruncatePrefix(3, 7);
+    EXPECT_TRUE(log.Matches(3, 7));
+    EXPECT_FALSE(log.Matches(3, 6));
+    EXPECT_FALSE(log.Matches(2, 7));
+}
+
+TEST(RaftLogTest, AtBelowStartIndexThrows) {
+    RaftLog log;
+    for (int i = 0; i < 5; ++i) {
+        log.Append(1, EntryType::kCommand, "x");
+    }
+    log.TruncatePrefix(3, 1);
+    EXPECT_THROW((void)log.At(2), std::out_of_range);
+    EXPECT_THROW((void)log.At(0), std::out_of_range);
+}

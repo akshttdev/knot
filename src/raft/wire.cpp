@@ -92,8 +92,7 @@ std::vector<std::uint8_t> Encode(const Envelope& env) {
                 p.set_leader_commit(msg.leader_commit);
                 p.SerializeToString(&buf);
                 return FrameOne(WireTag::kAppendEntriesReq, buf);
-            } else {
-                // AppendEntriesResp
+            } else if constexpr (std::is_same_v<T, AppendEntriesResp>) {
                 knot::rpc::AppendEntriesResponse p;
                 p.set_term(msg.term);
                 p.set_success(msg.success);
@@ -102,6 +101,21 @@ std::vector<std::uint8_t> Encode(const Envelope& env) {
                 p.set_conflict_term(msg.conflict_term);
                 p.SerializeToString(&buf);
                 return FrameOne(WireTag::kAppendEntriesResp, buf);
+            } else if constexpr (std::is_same_v<T, InstallSnapshotReq>) {
+                knot::rpc::InstallSnapshotRequest p;
+                p.set_term(msg.term);
+                p.set_leader_id(msg.leader_id);
+                p.set_last_included_index(msg.last_included_index);
+                p.set_last_included_term(msg.last_included_term);
+                p.set_data(msg.data);
+                p.SerializeToString(&buf);
+                return FrameOne(WireTag::kInstallSnapshotReq, buf);
+            } else {
+                // InstallSnapshotResp
+                knot::rpc::InstallSnapshotResponse p;
+                p.set_term(msg.term);
+                p.SerializeToString(&buf);
+                return FrameOne(WireTag::kInstallSnapshotResp, buf);
             }
         },
         env.msg);
@@ -193,6 +207,31 @@ DecodeResult DecodeOne(const std::uint8_t* buf, std::size_t len, const NodeId& s
             m.match_index = p.match_index();
             m.conflict_index = p.conflict_index();
             m.conflict_term = p.conflict_term();
+            result.envelope = Envelope{.from = "", .to = self_id, .msg = m};
+            return result;
+        }
+        case WireTag::kInstallSnapshotReq: {
+            knot::rpc::InstallSnapshotRequest p;
+            if (!p.ParseFromString(payload_str)) {
+                result.bytes_consumed = 0;
+                return result;
+            }
+            InstallSnapshotReq m;
+            m.term = p.term();
+            m.leader_id = p.leader_id();
+            m.last_included_index = p.last_included_index();
+            m.last_included_term = p.last_included_term();
+            m.data = p.data();
+            result.envelope = Envelope{.from = m.leader_id, .to = self_id, .msg = m};
+            return result;
+        }
+        case WireTag::kInstallSnapshotResp: {
+            knot::rpc::InstallSnapshotResponse p;
+            if (!p.ParseFromString(payload_str)) {
+                result.bytes_consumed = 0;
+                return result;
+            }
+            InstallSnapshotResp m{.term = p.term()};
             result.envelope = Envelope{.from = "", .to = self_id, .msg = m};
             return result;
         }

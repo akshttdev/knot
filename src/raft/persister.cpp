@@ -3,6 +3,8 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <string>
+#include <string_view>
 #include <system_error>
 #include <utility>
 #include <vector>
@@ -47,14 +49,44 @@ public:
         return true;
     }
 
+    void SaveSnapshot(std::string_view bytes, LogIdx last_included_index,
+                      Term last_included_term) override {
+        snap_bytes_ = std::string(bytes);
+        snap_idx_ = last_included_index;
+        snap_term_ = last_included_term;
+        has_snap_ = true;
+    }
+
+    bool LoadSnapshot(std::string* out_bytes, LogIdx* out_index, Term* out_term) override {
+        if (!has_snap_) {
+            return false;
+        }
+        if (out_bytes) {
+            *out_bytes = snap_bytes_;
+        }
+        if (out_index) {
+            *out_index = snap_idx_;
+        }
+        if (out_term) {
+            *out_term = snap_term_;
+        }
+        return true;
+    }
+
 private:
     PersistentState state_;
     bool has_state_ = false;
     std::vector<LogEntry> entries_;
+
+    std::string snap_bytes_;
+    LogIdx snap_idx_ = 0;
+    Term snap_term_ = 0;
+    bool has_snap_ = false;
 };
 
 constexpr std::uint32_t kStateMagic = 0x4B4E4F54U;      // "KNOT"
 constexpr std::uint32_t kLogRecordMagic = 0x4B4C4F47U;  // "KLOG"
+constexpr std::uint32_t kSnapshotMagic = 0x4B534E50U;   // "KSNP"
 
 // Table-less CRC32 (IEEE 802.3). Slower than a table-driven impl, but
 // matches the polynomial used in src/common/crc32.cpp and adds no deps.
@@ -206,6 +238,97 @@ public:
         for (const auto& e : kept) {
             AppendLog(e);
         }
+    }
+
+    void SaveSnapshot(std::string_view bytes, LogIdx last_included_index,
+                      Term last_included_term) override {
+        const auto tmp_path = dir_ / "snapshot.bin.tmp";
+        const auto final_path = dir_ / "snapshot.bin";
+
+        std::vector<std::uint8_t> buf;
+        buf.reserve(4 + 8 + 8 + 4 + bytes.size());
+        auto put32 = [&](std::uint32_t v) {
+            for (int i = 0; i < 4; ++i) {
+                buf.push_back(static_cast<std::uint8_t>(v >> (8 * i)));
+            }
+        };
+        auto put64 = [&](std::uint64_t v) {
+            for (int i = 0; i < 8; ++i) {
+                buf.push_back(static_cast<std::uint8_t>(v >> (8 * i)));
+            }
+        };
+        put32(kSnapshotMagic);
+        put64(last_included_index);
+        put64(last_included_term);
+        put32(static_cast<std::uint32_t>(bytes.size()));
+        buf.insert(buf.end(), bytes.begin(), bytes.end());
+
+        const int fd = ::open(tmp_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd < 0) {
+            throw std::system_error(errno, std::system_category(),
+                                    "FilePersister::SaveSnapshot open");
+        }
+        const ssize_t n = ::write(fd, buf.data(), buf.size());
+        if (n != static_cast<ssize_t>(buf.size())) {
+            const int saved_errno = errno;
+            ::close(fd);
+            throw std::system_error(saved_errno, std::system_category(),
+                                    "FilePersister::SaveSnapshot write");
+        }
+        FullSync(fd);
+        ::close(fd);
+        std::filesystem::rename(tmp_path, final_path);
+    }
+
+    bool LoadSnapshot(std::string* out_bytes, LogIdx* out_index, Term* out_term) override {
+        const auto path = dir_ / "snapshot.bin";
+        if (!std::filesystem::exists(path)) {
+            return false;
+        }
+        std::ifstream f(path, std::ios::binary);
+        if (!f) {
+            return false;
+        }
+        const std::vector<char> raw((std::istreambuf_iterator<char>(f)),
+                                    std::istreambuf_iterator<char>());
+        constexpr std::size_t kHeaderSize = 4 + 8 + 8 + 4;
+        if (raw.size() < kHeaderSize) {
+            return false;
+        }
+        auto get32 = [&](std::size_t off) {
+            std::uint32_t v = 0;
+            for (int i = 0; i < 4; ++i) {
+                v |= static_cast<std::uint32_t>(static_cast<std::uint8_t>(raw[off + i])) << (8 * i);
+            }
+            return v;
+        };
+        auto get64 = [&](std::size_t off) {
+            std::uint64_t v = 0;
+            for (int i = 0; i < 8; ++i) {
+                v |= static_cast<std::uint64_t>(static_cast<std::uint8_t>(raw[off + i])) << (8 * i);
+            }
+            return v;
+        };
+
+        if (get32(0) != kSnapshotMagic) {
+            return false;
+        }
+        const LogIdx idx = get64(4);
+        const Term term = get64(12);
+        const std::uint32_t plen = get32(20);
+        if (raw.size() < kHeaderSize + plen) {
+            return false;
+        }
+        if (out_bytes) {
+            *out_bytes = std::string(raw.data() + kHeaderSize, plen);
+        }
+        if (out_index) {
+            *out_index = idx;
+        }
+        if (out_term) {
+            *out_term = term;
+        }
+        return true;
     }
 
     bool Load(PersistentState* out_state, std::vector<LogEntry>* out_entries) override {

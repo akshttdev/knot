@@ -111,6 +111,37 @@ TEST(WireCodecTest, EncodeDecodeHandshakeYieldsSenderId) {
     EXPECT_EQ(*res.handshake_sender, "n1");
 }
 
+TEST(WireCodecTest, EncodeDecodeInstallSnapshotReq) {
+    Envelope in{.from = "L",
+                .to = "F",
+                .msg = InstallSnapshotReq{.term = 5,
+                                          .leader_id = "L",
+                                          .last_included_index = 42,
+                                          .last_included_term = 3,
+                                          .data = "snap-bytes"}};
+    const auto bytes = Encode(in);
+    const auto r = DecodeOne(bytes.data(), bytes.size(), "F");
+    ASSERT_TRUE(r.envelope.has_value());
+    ASSERT_TRUE(std::holds_alternative<InstallSnapshotReq>(r.envelope->msg));
+    const auto& m = std::get<InstallSnapshotReq>(r.envelope->msg);
+    EXPECT_EQ(m.term, 5U);
+    EXPECT_EQ(m.leader_id, "L");
+    EXPECT_EQ(m.last_included_index, 42U);
+    EXPECT_EQ(m.last_included_term, 3U);
+    EXPECT_EQ(m.data, "snap-bytes");
+    EXPECT_EQ(r.envelope->from, "L");
+}
+
+TEST(WireCodecTest, EncodeDecodeInstallSnapshotResp) {
+    Envelope in{.from = "F", .to = "L", .msg = InstallSnapshotResp{.term = 9}};
+    const auto bytes = Encode(in);
+    const auto r = DecodeOne(bytes.data(), bytes.size(), "L");
+    ASSERT_TRUE(r.envelope.has_value());
+    ASSERT_TRUE(std::holds_alternative<InstallSnapshotResp>(r.envelope->msg));
+    const auto& m = std::get<InstallSnapshotResp>(r.envelope->msg);
+    EXPECT_EQ(m.term, 9U);
+}
+
 TEST(TcpTransportSmokeTest, ConstructAndDestructDoesNotCrash) {
     auto t = MakeTcpTransport(
         /*self_id=*/"s", /*listen_host=*/"127.0.0.1", /*listen_port=*/0, /*peers=*/{});

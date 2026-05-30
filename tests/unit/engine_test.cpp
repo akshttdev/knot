@@ -230,6 +230,49 @@ TEST_F(EngineTest, RecoverFromMultipleFlushes) {
 }
 
 // ---------------------------------------------------------------------
+// Snapshot API
+// ---------------------------------------------------------------------
+
+TEST_F(EngineTest, ForEachLiveSurfacesNewestValues) {
+    auto e = ks::StorageEngine::Open({.data_dir = data_dir / "fea"});
+    e->Put("k", "v1");
+    e->Put("k", "v2");
+    std::vector<std::pair<std::string, std::string>> seen;
+    e->ForEachLive([&](std::string_view k, std::string_view v) {
+        seen.emplace_back(std::string(k), std::string(v));
+    });
+    ASSERT_EQ(seen.size(), 1U);
+    EXPECT_EQ(seen[0].first, "k");
+    EXPECT_EQ(seen[0].second, "v2");
+}
+
+TEST_F(EngineTest, SnapshotApplySnapshotRoundtrip) {
+    auto src = ks::StorageEngine::Open({.data_dir = data_dir / "src"});
+    src->Put("a", "1");
+    src->Put("b", "2");
+    src->Put("c", "3");
+    src->Delete("b");
+    const auto snap = src->Snapshot();
+
+    auto dst = ks::StorageEngine::Open({.data_dir = data_dir / "dst"});
+    dst->ApplySnapshot(snap);
+    std::string v;
+    EXPECT_EQ(dst->Get("a", &v), Result::kFound);
+    EXPECT_EQ(v, "1");
+    EXPECT_EQ(dst->Get("c", &v), Result::kFound);
+    EXPECT_EQ(v, "3");
+    EXPECT_EQ(dst->Get("b", &v), Result::kNotFound);
+}
+
+TEST_F(EngineTest, ApplyEmptySnapshotClearsExistingData) {
+    auto e = ks::StorageEngine::Open({.data_dir = data_dir / "clr"});
+    e->Put("k", "v");
+    e->ApplySnapshot("");
+    std::string v;
+    EXPECT_EQ(e->Get("k", &v), Result::kNotFound);
+}
+
+// ---------------------------------------------------------------------
 // Volume
 // ---------------------------------------------------------------------
 TEST_F(EngineTest, ManyKeysRoundtrip) {
